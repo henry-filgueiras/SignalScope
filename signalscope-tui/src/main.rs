@@ -22,6 +22,7 @@ mod capture;
 mod inspect;
 mod landmarks;
 mod replay;
+mod strip;
 mod theme;
 mod ui;
 

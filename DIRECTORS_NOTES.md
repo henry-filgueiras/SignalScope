@@ -295,6 +295,43 @@ highest-indexed landmark whose `event_index <= playhead` — the
 "most recent landmark we've crossed," which is what the panel
 highlights.
 
+### Timeline strip (replay minimap)
+
+A one-row strip sits below the replay header and projects the
+*entire recording* onto the available terminal width. Each column
+represents an equal slice of wall-clock time across the recording's
+full span. The cell at each column shows one of:
+
+- the **playhead marker** `┃` (bold accent) if the playhead falls
+  in that column — wins the cell regardless of any landmark there;
+- a **landmark glyph** sized by density and colored by the
+  highest-severity landmark in the slice: `·` for 1, `•` for 2-3,
+  `●` for 4+, colored red (`Alarm`) / green (`Recovery`) / blue
+  (`Notable`);
+- a dim `─` baseline if nothing of interest falls in the column.
+
+The strip exists so the *shape* of a recording reads in one glance
+before the eye reaches any words: a uniformly quiet recording is a
+mostly-empty line with the playhead bar; an incident-heavy
+recording shows clusters; a "ramped up then recovered" recording
+shows red on the left fading to green on the right. The operator
+sees what they're looking at, then where they're standing, before
+reading anything else.
+
+`signalscope-tui::strip` owns the projection math. The function
+`compute_strip_columns(landmarks, total_secs, offsets, cols)` is
+a pure function that returns one `StripCell` per column — easy to
+unit-test without ratatui. `column_for_offset(offset, total, cols)`
+gives the playhead column. Severity merge follows worst-wins:
+`Alarm > Recovery > Notable`. Renderer lives in `ui::
+render_timeline_strip`.
+
+Strip only renders in replay mode (live mode has no recording to
+project). The previously-eaten row of vertical space comes from
+the main content's `Min(10)` → `Min(9)` — the strip's value per
+row of screen is higher than any individual main-content row at
+that height.
+
 ### Landmarks pane
 
 In replay mode the bottom band (which is the event feed in live
@@ -557,6 +594,90 @@ The TUI owns the terminal, so logs go to a rotating file under
 ---
 
 ## Resolved Dragons and Pivots
+
+### 2026-05-28 — Claude Opus 4.7 (timeline strip: a one-row minimap of the whole recording)
+
+**Goal.** Recreational sweep — pick one feature that adds operator
+ergonomics + a bit of wonder, small-medium scope. Landed on a
+**timeline strip**: a thin minimap below the replay header that
+projects every landmark across the recording onto terminal columns,
+overlaid with the playhead position. The point is recognition
+before reading — the operator should see the *shape* of a six-hour
+recording (quiet, clustered, ramped-and-recovered) in one row,
+then read the words.
+
+**Design.** One row, full-width. Each column = `total_span / cols`
+seconds of wall-clock time. Per-column rules:
+
+- Playhead column → `┃` (bold, warn color). Wins over any
+  landmark in that slice, because "where am I?" is the more
+  urgent question than "what was here?".
+- Landmark-containing column → glyph by density (`·` for 1, `•`
+  for 2-3, `●` for 4+), colored by worst severity in the slice
+  (red `Alarm` / green `Recovery` / blue `Notable`).
+- Empty column → dim `─` baseline. Absence reads as absence.
+
+Worst-wins severity merge: `Alarm > Recovery > Notable`. Recovery
+beats Notable because a recovery is a meaningful state change,
+while Notable is "interesting context."
+
+**Module — `signalscope-tui::strip`.** Pure projection math kept
+separate from rendering so it's easy to unit-test. Surface:
+`StripCell { Empty, Landmarks { count, worst_severity } }`,
+`compute_strip_columns(landmarks, total_secs, offsets, cols)`,
+`column_for_offset(offset, total, cols)`, and
+`glyph_for_density(count)`. Renderer in `ui::render_timeline_strip`.
+
+**Replay layout reflow.** Replay mode's constraint vec grows a
+1-row strip slot between header and main, with main's `Min(10)`
+relaxed to `Min(9)` to make room. Live mode's layout is unchanged
+— there's no recording to project. The layout-selection logic is
+just one branch on `state.playback.is_some()`.
+
+**Help overlay** grew two legend lines explaining the strip
+glyphs, and was widened 56→62 and heightened 18→20 rows to fit.
+
+**Tests (12 new strip math tests, on top of 85):**
+
+- `zero_columns_returns_empty_vec`
+- `empty_landmarks_returns_all_baseline_cells`
+- `zero_total_span_returns_all_empty_even_with_landmarks`
+- `single_landmark_lands_in_expected_column`
+- `end_of_recording_lands_in_last_column_not_past_it` (catches
+  the off-by-one where a landmark exactly at the recording's
+  last second would otherwise index past `cols-1`)
+- `multiple_landmarks_in_one_column_accumulate_and_pick_worst_severity`
+- `recovery_beats_notable_when_no_alarm_present`
+- `column_for_offset_matches_landmark_projection` (consistency
+  guarantee between landmark column and playhead column)
+- `column_for_offset_clamps_to_last_column_at_end`
+- `column_for_offset_rejects_bad_inputs` (NaN / negative / zero
+  total span)
+- `glyph_thickness_grows_with_density`
+- `dense_recording_compresses_cleanly_to_narrow_strip` (100
+  landmarks across 5 columns: every landmark accounted for,
+  distribution ±1 per column)
+
+**Smoke.** `scripts/record.sh 8s -o $tmp` → 16 envelopes
+captured. `scripts/analyze.sh $tmp` loaded the session, built the
+Playback (including strip data), and reached the terminal-setup
+step cleanly. The strip itself is non-interactively-testable via
+the unit tests on `compute_strip_columns`.
+
+**What this buys.** The replay TUI now reads as a *time
+instrument*. The header tells you *where* (playhead +X of Y); the
+strip tells you *what shape* (quiet, busy, lopsided); the
+landmarks pane gives you the per-moment words; the dashboard
+gives you the state at the moment. Each row of the screen
+answers a different temporal question, and the strip is the one
+that makes the *whole recording* visible at once.
+
+**Untouched.** Bus shape, event model, sensors, analysis crate,
+session format, capture/inspect/observe paths, scripts, live
+dashboard, landmark deriver, landmark navigation. Pure addition
+in the TUI crate.
+
+`cargo test --workspace`: 97/97 green (up from 85).
 
 ### 2026-05-28 — Claude Opus 4.7 (timeline landmarks: replay compression via n/p)
 

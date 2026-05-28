@@ -21,31 +21,47 @@ use crate::theme;
 pub fn render(f: &mut Frame, state: &AppState) {
     let area = f.area();
 
-    let outer = Layout::new(
-        Direction::Vertical,
-        [
+    // Replay mode grows a one-row timeline strip below the header
+    // that visualizes the whole recording at once. Live mode keeps
+    // the original layout — there's no recording to visualize.
+    let replay = state.playback.is_some();
+    let constraints: Vec<Constraint> = if replay {
+        vec![
+            Constraint::Length(1), // header
+            Constraint::Length(1), // timeline strip
+            Constraint::Min(9),    // main
+            Constraint::Length(8), // landmarks pane
+            Constraint::Length(1), // footer
+        ]
+    } else {
+        vec![
             Constraint::Length(1), // header
             Constraint::Min(10),   // main
             Constraint::Length(8), // event feed
             Constraint::Length(1), // footer
-        ],
-    )
-    .split(area);
+        ]
+    };
+    let outer = Layout::new(Direction::Vertical, constraints).split(area);
 
-    render_header(f, outer[0], state);
-    render_main(f, outer[1], state);
-    // In replay mode the bottom band becomes the landmarks pane —
-    // event feed is less useful when you can hop directly between
-    // moments. In live mode it's still the event feed.
-    if state.playback.is_some() {
-        render_landmarks(f, outer[2], state);
-    } else {
-        render_feed(f, outer[2], state);
+    let mut i = 0;
+    render_header(f, outer[i], state);
+    i += 1;
+    if replay {
+        render_timeline_strip(f, outer[i], state);
+        i += 1;
     }
-    render_footer(f, outer[3], state);
+    render_main(f, outer[i], state);
+    i += 1;
+    if replay {
+        render_landmarks(f, outer[i], state);
+    } else {
+        render_feed(f, outer[i], state);
+    }
+    i += 1;
+    render_footer(f, outer[i], state);
 
     if state.show_help {
-        render_help_overlay(f, area, state.playback.is_some());
+        render_help_overlay(f, area, replay);
     }
 }
 
@@ -1333,6 +1349,83 @@ fn render_feed(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(List::new(items), inner);
 }
 
+/// One-row timeline strip — a minimap of the entire recording.
+///
+/// Each column represents an equal slice of wall-clock time across
+/// the recording's full span. The cell at each column shows:
+///
+/// * the playhead marker (`┃`, accent color, bold) if the playhead
+///   falls in that column — winning the cell regardless of any
+///   landmarks there, because "where am I?" is the more urgent
+///   question than "what was here?";
+/// * a colored glyph (`·` / `•` / `●` by density) for the highest-
+///   severity landmark in that column otherwise;
+/// * a dim baseline `─` if nothing of interest falls in the column.
+///
+/// The eye picks up the *shape* of the recording at a glance: even
+/// a six-hour file becomes a one-row sentence about where the
+/// activity is and where you're standing inside it.
+fn render_timeline_strip(f: &mut Frame, area: Rect, state: &AppState) {
+    use crate::landmarks::LandmarkSeverity;
+    use crate::strip::{column_for_offset, compute_strip_columns, glyph_for_density, StripCell};
+
+    let Some(p) = state.playback.as_ref() else {
+        return;
+    };
+    let cols = area.width as usize;
+    if cols == 0 {
+        return;
+    }
+
+    let total_secs = p.total_span().as_secs_f64();
+    let recording_start = p.first_at();
+    let landmark_offsets: Vec<f64> = p
+        .landmarks
+        .iter()
+        .map(|l| (l.at - recording_start).as_seconds_f64())
+        .collect();
+    let strip = compute_strip_columns(&p.landmarks, total_secs, landmark_offsets, cols);
+
+    let playhead_offset = (p.virtual_now() - recording_start).as_seconds_f64();
+    let playhead_col = column_for_offset(playhead_offset, total_secs, cols);
+
+    let mut spans = Vec::with_capacity(cols);
+    for (i, cell) in strip.iter().enumerate() {
+        if Some(i) == playhead_col {
+            // Playhead overrides whatever landmark color is here. Use a
+            // bold accent so the marker reads as a separate visual
+            // primitive from the landmark glyphs.
+            spans.push(Span::styled(
+                "┃".to_string(),
+                Style::default()
+                    .fg(theme::WARN_FG)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            continue;
+        }
+        match cell {
+            StripCell::Empty => {
+                spans.push(Span::styled("─".to_string(), theme::dim()));
+            }
+            StripCell::Landmarks {
+                count,
+                worst_severity,
+            } => {
+                let color = match worst_severity {
+                    LandmarkSeverity::Alarm => theme::BAD_FG,
+                    LandmarkSeverity::Recovery => theme::OK_FG,
+                    LandmarkSeverity::Notable => theme::INFO_FG,
+                };
+                spans.push(Span::styled(
+                    glyph_for_density(*count).to_string(),
+                    Style::default().fg(color),
+                ));
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 /// Compact landmarks pane — replay's primary navigation surface.
 /// Lists landmark rows as `+HH:MM:SS · CAT · headline`, color-coded
 /// by severity. Highlights the currently-active landmark (the most
@@ -1442,8 +1535,8 @@ fn fmt_offset_clock(secs: u64) -> String {
 }
 
 fn render_help_overlay(f: &mut Frame, area: Rect, replay_mode: bool) {
-    let h = if replay_mode { 18 } else { 11 };
-    let w = 56.min(area.width.saturating_sub(4));
+    let h = if replay_mode { 20 } else { 11 };
+    let w = 62.min(area.width.saturating_sub(4));
     let h = (h as u16).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
@@ -1471,6 +1564,14 @@ fn render_help_overlay(f: &mut Frame, area: Rect, replay_mode: bool) {
             Style::default()
                 .fg(theme::WARN_FG)
                 .add_modifier(Modifier::BOLD),
+        )));
+        body.push(Line::from(Span::styled(
+            "strip ─/·/•/●  empty / 1 / 2-3 / 4+ landmarks per column",
+            theme::dim(),
+        )));
+        body.push(Line::from(Span::styled(
+            "strip ┃        playhead",
+            theme::dim(),
         )));
         body.push(Line::from("[  /  ]        seek back/forward 1 event"));
         body.push(Line::from("{  /  }        seek back/forward 10 events"));
