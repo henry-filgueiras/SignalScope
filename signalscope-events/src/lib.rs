@@ -100,13 +100,53 @@ pub struct RoamDetected {
 }
 
 /// A correlation finding — analysis's best interpretation of recent events.
-/// Findings deliberately preserve ambiguity via `confidence` and `evidence`.
+///
+/// Findings carry both *judgement* (`confidence`, `evidence`) and
+/// *lifecycle* (`fingerprint`, `lifecycle`, `first_seen`, `last_seen`,
+/// `peak_confidence`). The lifecycle is what lets the UI behave like a
+/// systems observatory rather than a printf loop — analysis emits exactly
+/// when state *transitions*, not every time a rule re-fires.
+///
+/// Two findings with the same `fingerprint` refer to the same operational
+/// condition over time, e.g. `"rf_congestion:ch11"` or
+/// `"gateway_instability:192.168.1.1"`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorrelationFinding {
     pub kind: FindingKind,
+    pub fingerprint: String,
     pub headline: String,
     pub confidence: Confidence,
+    /// Highest confidence observed during this active streak. Resets to
+    /// the current value whenever a Resolved → Active edge happens.
+    pub peak_confidence: Confidence,
     pub evidence: Vec<String>,
+    pub lifecycle: FindingLifecycle,
+    pub first_seen: Timestamp,
+    pub last_seen: Timestamp,
+}
+
+impl CorrelationFinding {
+    /// Time elapsed between the first and most recent positive observation
+    /// of this finding fingerprint.
+    pub fn active_duration(&self) -> std::time::Duration {
+        let secs = (self.last_seen - self.first_seen).whole_seconds().max(0);
+        std::time::Duration::from_secs(secs as u64)
+    }
+}
+
+/// Lifecycle state of a finding. The bus only ever carries findings at
+/// these transition points — quiescent re-evaluations are suppressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FindingLifecycle {
+    /// First emission of this fingerprint in the current streak.
+    Active,
+    /// Re-emitted because confidence rose materially.
+    Escalating,
+    /// Re-emitted because confidence fell materially but the condition is
+    /// still active.
+    Recovering,
+    /// Condition no longer observed. The finding is being retired.
+    Resolved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

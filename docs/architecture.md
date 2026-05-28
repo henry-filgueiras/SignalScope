@@ -80,13 +80,50 @@ See [`sensor-model.md`](sensor-model.md) for adapter contracts.
 Findings preserve ambiguity. Each finding carries:
 
 - a `kind` (e.g. `RfCongestion`, `DnsPathology`),
+- a stable `fingerprint` string,
 - a one-line `headline`,
-- a `Confidence` in `0.0..=1.0`,
-- a short list of `evidence` strings.
+- a `Confidence` and a `peak_confidence` in `0.0..=1.0`,
+- a short list of `evidence` strings,
+- a `lifecycle` state (`Active` / `Escalating` / `Recovering` /
+  `Resolved`),
+- `first_seen` and `last_seen` timestamps.
 
 We do not pretend to know ground truth. We do not run statistical models.
 We do not invoke an LLM. The rules are hand-tuned heuristics that explain
 themselves. Better rules will replace them.
+
+## Findings are transitions, not heartbeats
+
+A printf-loop dashboard re-emits "RF congestion!" every poll for as long
+as the condition holds. SignalScope refuses to do this — it's noise, not
+observability. Inside the analysis crate the work is split:
+
+- `rules.rs` is **stateless**. Each rule looks at the current rolling
+  state and returns a `CandidateFinding` (kind, fingerprint, headline,
+  confidence, evidence) when its conditions are met.
+- `lifecycle.rs` is **stateful**. It keeps a small per-fingerprint table
+  with `first_seen`, `last_seen`, last-emitted confidence, and peak
+  confidence. On each step it compares the new candidate set against
+  the active set and emits `CorrelationFinding`s onto the bus only at
+  *transitions*:
+    * a fingerprint not previously active → `Active`,
+    * an active fingerprint whose confidence moved by more than
+      `material_delta` → `Escalating` or `Recovering`,
+    * an active fingerprint absent from candidates for
+      `resolved_after` → `Resolved`.
+
+Quiet cycles emit nothing. A `min_cooldown` floor prevents oscillating
+values from ping-ponging emissions even when the delta is material. The
+defaults are `material_delta = 0.15`, `min_cooldown = 15s`,
+`resolved_after = 20s`.
+
+Because the engine runs both on incoming events *and* on a periodic
+~2 s tick, resolutions still fire when sensors go quiet.
+
+The TUI reads the lifecycle directly: findings are keyed by fingerprint,
+dropped on `Resolved`, and the panel shows the lifecycle glyph and
+active duration. The event feed sees one line per transition, not one
+line per poll.
 
 ## Observation epistemics
 

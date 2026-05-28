@@ -1,18 +1,37 @@
 //! Lightweight correlation rules.
 //!
-//! Each rule returns at most one finding per evaluation. Confidence is a
-//! coarse hand-tuned score, intentionally cautious — the system should never
-//! claim certainty it doesn't have.
+//! Rules are *stateless*: they look at the current rolling state and
+//! produce a [`CandidateFinding`] when they fire. They do NOT decide
+//! whether to actually emit anything onto the bus — that decision belongs
+//! to the [`LifecycleTracker`](crate::lifecycle::LifecycleTracker), which
+//! sees candidates across cycles and only forwards transitions.
+//!
+//! Each rule attaches a stable *fingerprint* string so the tracker can
+//! recognise the same operational condition over time. Two findings with
+//! the same fingerprint refer to the same thing, even if other fields
+//! drift.
 
-use signalscope_events::{Confidence, CorrelationFinding, FindingKind};
+use signalscope_events::FindingKind;
 
 use crate::windows::{DnsWindow, GatewayWindow, WifiState};
+
+/// A finding as produced by a rule, before the lifecycle layer has
+/// decided what (if anything) to publish.
+#[derive(Debug, Clone)]
+pub struct CandidateFinding {
+    pub kind: FindingKind,
+    /// Stable identity for this condition — e.g. `"rf_congestion:ch11"`.
+    pub fingerprint: String,
+    pub headline: String,
+    pub confidence: f32,
+    pub evidence: Vec<String>,
+}
 
 pub fn evaluate(
     wifi: &WifiState,
     gateway: &GatewayWindow,
     dns: &DnsWindow,
-) -> Vec<CorrelationFinding> {
+) -> Vec<CandidateFinding> {
     let mut out = Vec::new();
     if let Some(f) = rf_congestion(wifi) {
         out.push(f);
@@ -29,9 +48,7 @@ pub fn evaluate(
     out
 }
 
-/// Many neighbors on the same channel as the associated AP. Suggests RF
-/// congestion / airtime contention.
-fn rf_congestion(wifi: &WifiState) -> Option<CorrelationFinding> {
+fn rf_congestion(wifi: &WifiState) -> Option<CandidateFinding> {
     let counts = wifi.neighbors_per_channel();
     if counts.is_empty() {
         return None;
@@ -47,12 +64,13 @@ fn rf_congestion(wifi: &WifiState) -> Option<CorrelationFinding> {
         _ => 0.8,
     };
 
-    Some(CorrelationFinding {
+    Some(CandidateFinding {
         kind: FindingKind::RfCongestion,
+        fingerprint: format!("rf_congestion:ch{busiest_ch}"),
         headline: format!(
-            "Likely RF congestion on channel {busiest_ch} ({busiest_count} APs visible)"
+            "RF congestion on channel {busiest_ch} ({busiest_count} APs visible)"
         ),
-        confidence: Confidence::new(confidence),
+        confidence,
         evidence: vec![
             format!("Neighbor APs on channel {busiest_ch}: {busiest_count}"),
             format!("Total visible APs: {}", wifi.last_neighbors.len()),
@@ -60,16 +78,13 @@ fn rf_congestion(wifi: &WifiState) -> Option<CorrelationFinding> {
     })
 }
 
-/// Loss or wildly variable RTT on the gateway probe. Could be RF, could be
-/// the gateway itself — we flag instability without naming a cause.
-fn gateway_instability(gateway: &GatewayWindow) -> Option<CorrelationFinding> {
+fn gateway_instability(gateway: &GatewayWindow) -> Option<CandidateFinding> {
     if gateway.len() < 5 {
         return None;
     }
     let loss = gateway.loss_ratio();
     let median = gateway.median_rtt_ms()?;
     let p95 = gateway.p95_rtt_ms()?;
-
     let jitter_ratio = if median > 0.0 { p95 / median } else { 1.0 };
 
     if loss < 0.05 && jitter_ratio < 4.0 {
@@ -79,15 +94,18 @@ fn gateway_instability(gateway: &GatewayWindow) -> Option<CorrelationFinding> {
     let confidence = ((loss as f64) * 1.5 + (jitter_ratio - 1.0).min(5.0) * 0.10)
         .clamp(0.0, 0.95) as f32;
 
-    Some(CorrelationFinding {
+    let target = gateway.target().unwrap_or("gateway");
+
+    Some(CandidateFinding {
         kind: FindingKind::GatewayInstability,
+        fingerprint: format!("gateway_instability:{target}"),
         headline: format!(
-            "Gateway unstable: {:.0}% loss, p95 {:.0} ms vs median {:.0} ms",
+            "Gateway {target} unstable: {:.0}% loss, p95 {:.0} ms vs median {:.0} ms",
             loss * 100.0,
             p95,
             median
         ),
-        confidence: Confidence::new(confidence),
+        confidence,
         evidence: vec![
             format!("Loss ratio: {:.2}", loss),
             format!("Median RTT: {:.1} ms", median),
@@ -97,9 +115,7 @@ fn gateway_instability(gateway: &GatewayWindow) -> Option<CorrelationFinding> {
     })
 }
 
-/// DNS failing or slow while the gateway is fine. Strongly suggests resolver
-/// pathology rather than RF — that's what makes this a useful correlation.
-fn dns_pathology(dns: &DnsWindow, gateway: &GatewayWindow) -> Option<CorrelationFinding> {
+fn dns_pathology(dns: &DnsWindow, gateway: &GatewayWindow) -> Option<CandidateFinding> {
     if dns.len() < 4 {
         return None;
     }
@@ -118,19 +134,18 @@ fn dns_pathology(dns: &DnsWindow, gateway: &GatewayWindow) -> Option<Correlation
     let confidence = if gateway_is_healthy {
         (fail64 * 1.5 + dns_median / 1000.0).clamp(0.3, 0.9) as f32
     } else {
-        // Gateway also looks bad — DNS may just be downstream of the network
-        // issue. Lower confidence.
         (fail64 + dns_median / 2000.0).clamp(0.15, 0.55) as f32
     };
 
-    Some(CorrelationFinding {
+    Some(CandidateFinding {
         kind: FindingKind::DnsPathology,
+        fingerprint: "dns_pathology".to_string(),
         headline: format!(
             "DNS pathology: {:.0}% failures, median {:.0} ms",
             fail * 100.0,
             dns_median
         ),
-        confidence: Confidence::new(confidence),
+        confidence,
         evidence: vec![
             format!("DNS failure ratio: {:.2}", fail),
             format!("DNS median RTT: {:.1} ms", dns_median),
@@ -140,9 +155,7 @@ fn dns_pathology(dns: &DnsWindow, gateway: &GatewayWindow) -> Option<Correlation
     })
 }
 
-/// Very weak associated RSSI while a much stronger neighbor on the same SSID
-/// is available. Classic sticky-client behavior.
-fn sticky_client(wifi: &WifiState) -> Option<CorrelationFinding> {
+fn sticky_client(wifi: &WifiState) -> Option<CandidateFinding> {
     let rssi = wifi.last_rssi_dbm?;
     let ssid = wifi.current_ssid.as_ref()?;
     let bssid = wifi.current_bssid.as_ref()?;
@@ -181,12 +194,13 @@ fn sticky_client(wifi: &WifiState) -> Option<CorrelationFinding> {
         _ => 0.8,
     };
 
-    Some(CorrelationFinding {
+    Some(CandidateFinding {
         kind: FindingKind::StickyClient,
+        fingerprint: format!("sticky_client:{ssid}"),
         headline: format!(
             "Sticky client suspected: holding {rssi} dBm while {alt_bssid} is {alt_rssi} dBm"
         ),
-        confidence: Confidence::new(confidence),
+        confidence,
         evidence: vec![
             format!("Current AP RSSI: {rssi} dBm"),
             format!("Strongest same-SSID neighbor RSSI: {alt_rssi} dBm"),

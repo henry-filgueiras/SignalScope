@@ -56,9 +56,21 @@ transitively. New sensors that need a new event variant must add it in
 
 ### Correlation philosophy
 
-Findings carry `kind`, `headline`, `Confidence` in `0.0..=1.0`, and
-`evidence`. Rules are intentionally cautious hand-tuned heuristics — never
-"the system says X". The TUI shows confidence so the operator can judge.
+Findings carry `kind`, stable `fingerprint`, `headline`, `Confidence`,
+`peak_confidence`, `evidence`, `lifecycle`, and `first_seen`/`last_seen`
+timestamps. Rules are intentionally cautious hand-tuned heuristics —
+never "the system says X". The TUI shows confidence and the active
+duration so the operator can judge.
+
+The analysis crate is split into two halves: **rules** (stateless,
+produce `CandidateFinding`s every cycle) and **lifecycle** (stateful,
+emits onto the bus only on `Active` / `Escalating` / `Recovering` /
+`Resolved` transitions). Quiescent re-evaluations are suppressed by a
+`material_delta` of 0.15, a `min_cooldown` of 15 s between consecutive
+emissions of the same fingerprint, and a `resolved_after` of 20 s.
+
+The engine evaluates both on incoming sensor events and on a 2 s
+periodic tick, so resolutions still fire when sensors are quiet.
 
 ### Observation epistemics
 
@@ -138,6 +150,65 @@ The TUI owns the terminal, so logs go to a rotating file under
 ---
 
 ## Resolved Dragons and Pivots
+
+### 2026-05-28 — Claude Opus 4.7 (findings → transitions)
+
+**Demoted from Canon, verbatim:**
+
+> Findings carry `kind`, `headline`, `Confidence` in `0.0..=1.0`, and
+> `evidence`. Rules are intentionally cautious hand-tuned heuristics — never
+> "the system says X". The TUI shows confidence so the operator can judge.
+
+**Problem.** The previous engine ran `rules::evaluate()` on every
+gateway / DNS / scan event and republished every firing finding. With
+the gateway sensor at 1 Hz, a single persistent condition (e.g. DNS
+pathology) produced dozens of identical "find ..." lines per minute in
+the event feed. Visually loud, operationally meaningless, and it
+trained the operator to ignore findings entirely — the opposite of what
+this surface is for.
+
+**Pivot.** Findings are now state transitions, not heartbeats.
+
+- `CorrelationFinding` gained `fingerprint: String`,
+  `peak_confidence: Confidence`, `lifecycle: FindingLifecycle`,
+  `first_seen: Timestamp`, `last_seen: Timestamp`. Active duration is
+  a computed accessor.
+- New `FindingLifecycle` enum: `Active`, `Escalating`, `Recovering`,
+  `Resolved`.
+- `rules.rs` is now stateless: each rule returns a `CandidateFinding`
+  with a stable fingerprint (e.g. `"rf_congestion:ch11"`,
+  `"gateway_instability:192.168.1.1"`, `"sticky_client:HomeAP"`,
+  `"dns_pathology"`). Headlines are framing-neutral — the lifecycle
+  layer decorates them.
+- New `lifecycle.rs` owns a tiny per-fingerprint state table and
+  decides what to publish:
+    * new fingerprint → `Active` with `first_seen = now`,
+    * existing fingerprint with confidence delta ≥ `material_delta`
+      (0.15) and `min_cooldown` (15 s) elapsed → `Escalating` /
+      `Recovering`,
+    * fingerprint missing from candidates for `resolved_after` (20 s)
+      → `Resolved`, then dropped.
+  All other cycles emit nothing.
+- The engine grew a 2 s safety-net tick so resolutions fire even with
+  no incoming events, and `LifecycleConfig` is now configurable via
+  `AnalysisEngine::with_lifecycle_config`.
+- TUI: findings are keyed by fingerprint (so RF congestion on ch11
+  and ch36 coexist instead of overwriting), dropped on `Resolved`, and
+  the panel shows a lifecycle glyph (`●` / `↑` / `↓` / `○`) plus the
+  active duration. The feed feed-line decorates the lifecycle on
+  transition events, so the wall of red goes away.
+
+**Tests.** Ten new lifecycle tests pin the transition semantics:
+first-emit-is-Active, repeated-no-emit, sub-threshold-suppressed,
+material-rise-escalates, material-drop-recovers, absent-resolves,
+cooldown-suppresses-oscillation, brief-flicker-does-not-resolve,
+different-fingerprints-are-independent, resolved-headline-suffix. All
+green; total workspace tests now 20/20.
+
+**What didn't change.** The Wi-Fi card, neighbor list, gateway and
+DNS sparklines, event feed shape, sensor health panel, observation
+confidence — all unchanged. The pivot is contained to analysis and a
+~50 LOC TUI edit.
 
 ### 2026-05-28 — Claude Opus 4.7 (Wi-Fi backend pivot)
 

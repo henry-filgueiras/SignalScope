@@ -19,7 +19,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use signalscope_core::EventBus;
 use signalscope_events::{
-    CorrelationFinding, DnsLatencyObservation, Envelope, Event, FindingKind,
+    CorrelationFinding, DnsLatencyObservation, Envelope, Event, FindingLifecycle,
     GatewayLatencyObservation, ScanResult, SensorHealth, SensorId, WifiObservation,
 };
 use tokio::time::interval;
@@ -173,7 +173,10 @@ pub struct AppState {
     pub latest_scan: Option<ScanResult>,
     pub gateway_history: VecDeque<GatewayLatencyObservation>,
     pub dns_history: VecDeque<DnsLatencyObservation>,
-    pub findings: HashMap<FindingKind, (Instant, CorrelationFinding)>,
+    /// Currently-active findings keyed by their stable fingerprint. The
+    /// engine retires findings by emitting Resolved; we drop them from
+    /// this map at that point so the panel stays calm.
+    pub findings: HashMap<String, CorrelationFinding>,
     pub sensor_health: HashMap<SensorId, SensorHealth>,
     pub event_feed: VecDeque<FeedItem>,
     pub focus: Focus,
@@ -216,10 +219,14 @@ impl AppState {
                 }
                 self.dns_history.push_back(o.clone());
             }
-            Event::Finding(f) => {
-                self.findings
-                    .insert(f.kind, (Instant::now(), f.clone()));
-            }
+            Event::Finding(f) => match f.lifecycle {
+                FindingLifecycle::Resolved => {
+                    self.findings.remove(&f.fingerprint);
+                }
+                _ => {
+                    self.findings.insert(f.fingerprint.clone(), f.clone());
+                }
+            },
             Event::SensorHealth(h) => {
                 self.sensor_health.insert(h.sensor.clone(), h.clone());
             }
@@ -308,12 +315,20 @@ fn format_feed_line(env: &Envelope) -> Option<FeedItem> {
             r.from_rssi_dbm.map_or("—".into(), |v| format!("{v} dBm")),
             r.to_rssi_dbm.map_or("—".into(), |v| format!("{v} dBm")),
         ),
-        Event::Finding(f) => format!(
-            "find   [{:?} c={:.2}] {}",
-            f.kind,
-            f.confidence.value(),
-            f.headline
-        ),
+        Event::Finding(f) => {
+            let marker = match f.lifecycle {
+                FindingLifecycle::Active => "●",
+                FindingLifecycle::Escalating => "↑",
+                FindingLifecycle::Recovering => "↓",
+                FindingLifecycle::Resolved => "○",
+            };
+            format!(
+                "find   {marker} [{:?} c={:.2}] {}",
+                f.kind,
+                f.confidence.value(),
+                f.headline
+            )
+        }
         Event::SensorHealth(h) => {
             let backend = h.backend.as_deref().unwrap_or("—");
             let detail = h

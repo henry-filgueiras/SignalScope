@@ -1,14 +1,18 @@
 //! Platform-agnostic correlation engine.
 //!
-//! The engine subscribes to the event bus, maintains a small amount of
-//! rolling state per signal, runs a handful of lightweight rules over that
-//! state, and publishes [`signalscope_events::CorrelationFinding`] events
-//! back onto the bus. It never inspects platform APIs, never reads files,
-//! and never reads sensors directly — its only input is normalized events.
+//! Two stages:
 //!
-//! Rules deliberately preserve ambiguity: each finding carries a confidence
-//! score and a short list of evidence strings so the UI can render the
-//! reasoning, not just the conclusion.
+//! 1. **Rules** (`rules.rs`) are stateless. They look at the current
+//!    rolling state and produce a flat set of `CandidateFinding`s for
+//!    whatever conditions are currently firing.
+//! 2. **Lifecycle** (`lifecycle.rs`) is stateful. It compares the current
+//!    candidate set against the previous one and emits
+//!    `CorrelationFinding`s only on *transitions* —
+//!    new conditions, material confidence changes, resolutions.
+//!
+//! That split is why the dashboard stays calm: rules can fire as often as
+//! they like, but the bus only carries findings when something actually
+//! changes operationally.
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
@@ -18,12 +22,17 @@ use std::time::Duration;
 
 use signalscope_core::EventBus;
 use signalscope_events::{CorrelationFinding, Event, RoamDetected, SensorId};
+use time::OffsetDateTime;
 use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 use tracing::debug;
 
+mod lifecycle;
 mod rules;
 mod windows;
 
+pub use lifecycle::LifecycleConfig;
+use lifecycle::LifecycleTracker;
 use windows::{DnsWindow, GatewayWindow, WifiState};
 
 const SOURCE: &str = "analysis";
@@ -32,14 +41,28 @@ const SOURCE: &str = "analysis";
 /// real-time, and slow-moving rules feel laggy.
 const WINDOW: Duration = Duration::from_secs(30);
 
+/// Cadence of the safety-net evaluation tick. Driven by a timer rather
+/// than incoming events so resolutions still fire when all sensors are
+/// quiet (e.g. Wi-Fi off, gateway unreachable).
+const LIFECYCLE_TICK: Duration = Duration::from_secs(2);
+
 #[derive(Debug)]
 pub struct AnalysisEngine {
     bus: Arc<EventBus>,
+    lifecycle_config: LifecycleConfig,
 }
 
 impl AnalysisEngine {
     pub fn new(bus: Arc<EventBus>) -> Self {
-        Self { bus }
+        Self {
+            bus,
+            lifecycle_config: LifecycleConfig::default(),
+        }
+    }
+
+    pub fn with_lifecycle_config(mut self, config: LifecycleConfig) -> Self {
+        self.lifecycle_config = config;
+        self
     }
 
     pub fn spawn(self) -> JoinHandle<()> {
@@ -51,34 +74,55 @@ impl AnalysisEngine {
         let mut wifi = WifiState::default();
         let mut gateway = GatewayWindow::new(WINDOW);
         let mut dns = DnsWindow::new(WINDOW);
+        let mut tracker = LifecycleTracker::new(self.lifecycle_config.clone());
+
+        let mut tick = tokio::time::interval(LIFECYCLE_TICK);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         // Seed from backlog so analysis is immediately useful on startup.
         for env in self.bus.recent() {
             ingest(&env.event, &mut wifi, &mut gateway, &mut dns);
         }
 
-        while let Some(env) = sub.recv().await {
-            ingest(&env.event, &mut wifi, &mut gateway, &mut dns);
+        loop {
+            tokio::select! {
+                maybe_env = sub.recv() => {
+                    let Some(env) = maybe_env else {
+                        debug!("event bus closed; analysis loop terminating");
+                        break;
+                    };
+                    ingest(&env.event, &mut wifi, &mut gateway, &mut dns);
 
-            // Per-event derived signals: roams.
-            if let Some(roam) = wifi.take_pending_roam() {
-                self.publish_roam(roam);
-            }
+                    if let Some(roam) = wifi.take_pending_roam() {
+                        self.publish_roam(roam);
+                    }
 
-            // Periodic-ish: run rules on every gateway/DNS/scan tick. This is
-            // cheap and avoids a separate scheduler.
-            match &env.event {
-                Event::GatewayLatency(_)
-                | Event::DnsLatency(_)
-                | Event::Scan(_) => {
-                    for finding in rules::evaluate(&wifi, &gateway, &dns) {
-                        self.publish_finding(finding);
+                    if triggers_rule_evaluation(&env.event) {
+                        self.evaluate(&wifi, &gateway, &dns, &mut tracker);
                     }
                 }
-                _ => {}
+                _ = tick.tick() => {
+                    // Periodic safety net: even with no incoming events,
+                    // re-evaluate so resolutions and quiescent transitions
+                    // get a chance to fire.
+                    self.evaluate(&wifi, &gateway, &dns, &mut tracker);
+                }
             }
         }
-        debug!("analysis loop terminated");
+    }
+
+    fn evaluate(
+        &self,
+        wifi: &WifiState,
+        gateway: &GatewayWindow,
+        dns: &DnsWindow,
+        tracker: &mut LifecycleTracker,
+    ) {
+        let candidates = rules::evaluate(wifi, gateway, dns);
+        let now = OffsetDateTime::now_utc();
+        for finding in tracker.step(candidates, now) {
+            self.publish_finding(finding);
+        }
     }
 
     fn publish_finding(&self, finding: CorrelationFinding) {
@@ -90,6 +134,13 @@ impl AnalysisEngine {
         self.bus
             .publish(SensorId::new(SOURCE), Event::RoamDetected(roam));
     }
+}
+
+fn triggers_rule_evaluation(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::GatewayLatency(_) | Event::DnsLatency(_) | Event::Scan(_) | Event::Wifi(_)
+    )
 }
 
 fn ingest(
@@ -109,4 +160,3 @@ fn ingest(
         | Event::SensorHealth(_) => {}
     }
 }
-

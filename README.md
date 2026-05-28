@@ -31,6 +31,9 @@ architectural goal — see [`docs/architecture.md`](docs/architecture.md) and
 - gateway latency probe + rolling sparkline
 - DNS latency probe + rolling sparkline
 - lightweight correlation rules with confidence + evidence
+- lifecycle-aware findings (Active / Escalating / Recovering / Resolved)
+  — the dashboard reacts to *transitions*, not every poll, so the feed
+  stays calm even when a condition holds for minutes
 - rolling event feed
 - graceful resize, clean shutdown, structured file logging
 

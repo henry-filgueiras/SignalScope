@@ -68,6 +68,10 @@ pub struct GatewaySample {
 pub struct GatewayWindow {
     span: Duration,
     samples: VecDeque<GatewaySample>,
+    /// Target IP / hostname from the most recently recorded observation —
+    /// used as a fingerprint discriminator so a gateway swap creates a new
+    /// finding instance rather than mutating the old one.
+    target: Option<String>,
 }
 
 impl GatewayWindow {
@@ -75,17 +79,23 @@ impl GatewayWindow {
         Self {
             span,
             samples: VecDeque::new(),
+            target: None,
         }
     }
 
     pub fn record(&mut self, obs: &GatewayLatencyObservation) {
         let now = OffsetDateTime::now_utc();
+        self.target = Some(obs.target.clone());
         self.samples.push_back(GatewaySample {
             at: now,
             rtt: obs.rtt,
             reachable: obs.reachable,
         });
         self.evict(now);
+    }
+
+    pub fn target(&self) -> Option<&str> {
+        self.target.as_deref()
     }
 
     fn evict(&mut self, now: OffsetDateTime) {

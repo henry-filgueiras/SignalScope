@@ -9,8 +9,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Wrap};
 use ratatui::Frame;
 use signalscope_events::{
-    CorrelationFinding, DnsLatencyObservation, EventCategory, GatewayLatencyObservation,
-    NeighborAp, ObservationConfidence, SensorHealth, SensorState, WifiObservation,
+    CorrelationFinding, DnsLatencyObservation, EventCategory, FindingLifecycle,
+    GatewayLatencyObservation, NeighborAp, ObservationConfidence, SensorHealth, SensorState,
+    WifiObservation,
 };
 
 use crate::app::{AppState, FeedItem};
@@ -504,12 +505,11 @@ fn render_findings(f: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    let mut entries: Vec<&CorrelationFinding> =
-        state.findings.values().map(|(_, f)| f).collect();
+    let mut entries: Vec<&CorrelationFinding> = state.findings.values().collect();
     entries.sort_by(|a, b| {
-        b.confidence
+        b.peak_confidence
             .value()
-            .partial_cmp(&a.confidence.value())
+            .partial_cmp(&a.peak_confidence.value())
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
@@ -518,24 +518,54 @@ fn render_findings(f: &mut Frame, area: Rect, state: &AppState) {
         .take(inner.height as usize)
         .map(|f| {
             let conf = f.confidence.value();
-            let color = if conf >= 0.7 {
+            let conf_color = if conf >= 0.7 {
                 theme::BAD_FG
             } else if conf >= 0.4 {
                 theme::WARN_FG
             } else {
                 theme::INFO_FG
             };
+            let (marker, marker_color) = lifecycle_glyph(f.lifecycle);
+            let duration = humanize_duration(f.active_duration());
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("c={conf:.2} "),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    format!("{marker} "),
+                    Style::default().fg(marker_color).add_modifier(Modifier::BOLD),
                 ),
+                Span::styled(
+                    format!("c={conf:.2} "),
+                    Style::default().fg(conf_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("{duration:<5} "), theme::dim()),
                 Span::styled(f.headline.clone(), theme::value()),
             ]))
         })
         .collect();
 
     f.render_widget(List::new(items), inner);
+}
+
+fn lifecycle_glyph(state: FindingLifecycle) -> (&'static str, ratatui::style::Color) {
+    match state {
+        FindingLifecycle::Active => ("●", theme::BAD_FG),
+        FindingLifecycle::Escalating => ("↑", theme::BAD_FG),
+        FindingLifecycle::Recovering => ("↓", theme::WARN_FG),
+        FindingLifecycle::Resolved => ("○", theme::OK_FG),
+    }
+}
+
+fn humanize_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
 }
 
 fn render_feed(f: &mut Frame, area: Rect, state: &AppState) {
