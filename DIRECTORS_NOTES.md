@@ -595,6 +595,31 @@ The TUI owns the terminal, so logs go to a rotating file under
 
 ## Resolved Dragons and Pivots
 
+### 2026-05-28 — Claude Opus 4.7 (README sync)
+
+The README had drifted considerably from project reality — it
+predated the iface sensor, throughput plane, `TemporalSeries`,
+session recording / inspect / analyze, scripts, landmarks, and
+the timeline strip. Rewrote it as a first-read-friendly tour:
+
+- a "three things you can do with it" intro framing observe /
+  capture / analyze as the three operating modes;
+- a copy-pasteable Quick Start using `scripts/record.sh` +
+  `scripts/analyze.sh`;
+- a "Replay at a glance" schematic showing the timeline strip,
+  landmarks pane, and virtualized-now dashboard together so a
+  first-time reader sees what the tool *feels* like before any
+  configuration discussion;
+- session file format documented inline with a JSON sample;
+- keyboard cheatsheet split into common + replay-only tables;
+- "What's intentionally not here yet" updated — session
+  recording and replay are no longer in it; "Linux sensors" and
+  "real-time playback" added.
+
+No code changes. Canon was already current; this entry only
+records that the README's audience-facing surface was reconciled
+to match it.
+
 ### 2026-05-28 — Claude Opus 4.7 (timeline strip: a one-row minimap of the whole recording)
 
 **Goal.** Recreational sweep — pick one feature that adds operator
