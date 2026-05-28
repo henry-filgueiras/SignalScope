@@ -542,8 +542,10 @@ impl InterfaceThroughputWindow {
         self.samples.back()
     }
 
-    /// Bytes-per-second over the window. `None` until we have at least
-    /// two samples spaced ≥1 second apart.
+    /// Bytes-per-second averaged over the entire retained window.
+    /// `None` until we have at least two samples spaced ≥1 second apart.
+    /// This is the "rolling average" view that's right for headline
+    /// numbers; sparkline bars should use [`Self::step_throughput`].
     pub fn throughput_bps(&self) -> Option<Throughput> {
         let last = self.samples.back()?;
         let first = self.samples.front()?;
@@ -555,6 +557,28 @@ impl InterfaceThroughputWindow {
             rx_bps: ((last.rx_bytes - first.rx_bytes) as f64 / dt) * 8.0,
             tx_bps: ((last.tx_bytes - first.tx_bytes) as f64 / dt) * 8.0,
             sample_span: Duration::from_secs(dt as u64),
+        })
+    }
+
+    /// Per-step throughput — the rate between the most recent sample
+    /// and the one immediately before it. This is the bursty,
+    /// non-smoothed view sparklines should feed off: a sustained
+    /// transfer looks like a plateau, a burst like a spike, idle as
+    /// zero. `None` until at least two samples exist.
+    pub fn step_throughput(&self) -> Option<Throughput> {
+        if self.samples.len() < 2 {
+            return None;
+        }
+        let last = self.samples.back()?;
+        let prev = self.samples.iter().nth_back(1)?;
+        let dt = (last.at - prev.at).as_seconds_f64();
+        if dt <= 0.0 {
+            return None;
+        }
+        Some(Throughput {
+            rx_bps: ((last.rx_bytes - prev.rx_bytes) as f64 / dt) * 8.0,
+            tx_bps: ((last.tx_bytes - prev.tx_bytes) as f64 / dt) * 8.0,
+            sample_span: Duration::from_secs_f64(dt),
         })
     }
 
@@ -701,6 +725,25 @@ mod tests {
         w.record(&counters("en0", 1_000, 100), ts(0));
         // Only one sample → no throughput yet.
         assert!(w.throughput_bps().is_none());
+        assert!(w.step_throughput().is_none());
+    }
+
+    #[test]
+    fn step_throughput_uses_only_last_pair() {
+        let mut w = InterfaceThroughputWindow::new(Duration::from_secs(60));
+        // Quiescent run at ts(0), ts(2), … ts(8).
+        for offset in 0..5 {
+            w.record(&counters("en0", 0, 0), ts(offset * 2));
+        }
+        // Burst between ts(8) and ts(10): 1 MB / 2 s = 500_000 B/s = 4 Mbps.
+        w.record(&counters("en0", 1_000_000, 0), ts(10));
+        let step = w.step_throughput().expect("expected step throughput");
+        assert!((step.rx_bps - 4_000_000.0).abs() < 1.0, "got {}", step.rx_bps);
+
+        // The rolling-average view should be lower than the burst because
+        // it dilutes the spike across the entire quiescent window.
+        let avg = w.throughput_bps().expect("expected average");
+        assert!(avg.rx_bps < step.rx_bps, "avg {} step {}", avg.rx_bps, step.rx_bps);
     }
 
     #[test]

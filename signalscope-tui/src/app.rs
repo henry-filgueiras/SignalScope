@@ -18,7 +18,7 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use signalscope_analysis::{InterfaceThroughputWindow, Throughput};
-use signalscope_core::EventBus;
+use signalscope_core::{EventBus, TemporalSeries};
 use signalscope_events::{
     Bssid, CorrelationFinding, DnsLatencyObservation, Envelope, Event, FindingLifecycle,
     GatewayLatencyObservation, InterfaceCountersObservation, ScanResult, SensorHealth, SensorId,
@@ -37,6 +37,10 @@ const SIGNAL_HISTORY: usize = 90;
 /// analysis crate's `THROUGHPUT_WINDOW` so the dashboard and the future
 /// finding rules speak about the same rolling rate.
 const THROUGHPUT_WINDOW: Duration = Duration::from_secs(15);
+/// How many per-step throughput samples to retain for the RX/TX
+/// sparklines. At the iface sensor's 2 s cadence this is ~10 min of
+/// rolling history — enough to see a transfer crest and recover.
+const THROUGHPUT_HISTORY: usize = 300;
 
 pub async fn run(bus: Arc<EventBus>) -> Result<()> {
     let mut state = AppState::new();
@@ -176,23 +180,16 @@ impl Focus {
     }
 }
 
-/// A single connected-link RSSI reading retained for the local sparkline
-/// and for the "Δ over 60s" callout. Kept in the TUI rather than read
-/// back from the analysis crate to keep concerns separate — the engine's
-/// trend windows feed the findings panel; this buffer feeds the visual.
-#[derive(Debug, Clone)]
-pub struct SignalSample {
-    pub at: time::OffsetDateTime,
-    pub rssi_dbm: i32,
-}
-
 #[derive(Debug)]
 pub struct AppState {
     pub started_at: Instant,
     pub latest_wifi: Option<WifiObservation>,
     pub latest_scan: Option<ScanResult>,
-    pub gateway_history: VecDeque<GatewayLatencyObservation>,
-    pub dns_history: VecDeque<DnsLatencyObservation>,
+    /// Wall-clock-timestamped gateway probe history. Each sample carries
+    /// the full observation so the panel can read out target, RTT, and
+    /// reachability without a parallel structure.
+    pub gateway_history: TemporalSeries<GatewayLatencyObservation>,
+    pub dns_history: TemporalSeries<DnsLatencyObservation>,
     /// Currently-active findings keyed by their stable fingerprint. The
     /// engine retires findings by emitting Resolved; we drop them from
     /// this map at that point so the panel stays calm.
@@ -208,8 +205,9 @@ pub struct AppState {
     /// Wi-Fi is off / unavailable.
     pub connected_since: Option<time::OffsetDateTime>,
     /// Rolling RSSI samples for the connected-link sparkline and Δ
-    /// callout. Caps at `SIGNAL_HISTORY` entries (~15 min at 10 s cadence).
-    pub signal_history: VecDeque<SignalSample>,
+    /// callout. Reset on association change and on Wi-Fi sensor
+    /// degradation.
+    pub signal_history: TemporalSeries<i32>,
     /// Most recent interface counter snapshot. Kept verbatim so the
     /// dashboard can show absolute totals next to the derived rate.
     pub latest_counters: Option<InterfaceCountersObservation>,
@@ -217,6 +215,11 @@ pub struct AppState {
     /// crate so future throughput rules and the dashboard agree on what
     /// "now" means.
     pub throughput: InterfaceThroughputWindow,
+    /// Per-step RX rate samples in bits/sec — one row per counter pair.
+    /// Bursts show as spikes, idle as zeros, sustained transfer as a
+    /// plateau. Fed by [`InterfaceThroughputWindow::step_throughput`].
+    pub rx_throughput_history: TemporalSeries<f64>,
+    pub tx_throughput_history: TemporalSeries<f64>,
     pub focus: Focus,
     pub show_help: bool,
     /// When true, the RF environment panel renders the neighbor AP table
@@ -231,16 +234,18 @@ impl AppState {
             started_at: Instant::now(),
             latest_wifi: None,
             latest_scan: None,
-            gateway_history: VecDeque::with_capacity(GATEWAY_HISTORY),
-            dns_history: VecDeque::with_capacity(DNS_HISTORY),
+            gateway_history: TemporalSeries::new(GATEWAY_HISTORY),
+            dns_history: TemporalSeries::new(DNS_HISTORY),
             findings: HashMap::new(),
             sensor_health: HashMap::new(),
             event_feed: VecDeque::with_capacity(EVENT_FEED_LIMIT),
             connected_identity: (None, None),
             connected_since: None,
-            signal_history: VecDeque::with_capacity(SIGNAL_HISTORY),
+            signal_history: TemporalSeries::new(SIGNAL_HISTORY),
             latest_counters: None,
             throughput: InterfaceThroughputWindow::new(THROUGHPUT_WINDOW),
+            rx_throughput_history: TemporalSeries::new(THROUGHPUT_HISTORY),
+            tx_throughput_history: TemporalSeries::new(THROUGHPUT_HISTORY),
             focus: Focus::Overview,
             show_help: false,
             show_neighbor_detail: false,
@@ -257,16 +262,10 @@ impl AppState {
                 self.latest_scan = Some(s.clone());
             }
             Event::GatewayLatency(o) => {
-                if self.gateway_history.len() == GATEWAY_HISTORY {
-                    self.gateway_history.pop_front();
-                }
-                self.gateway_history.push_back(o.clone());
+                self.gateway_history.push(env.at, o.clone());
             }
             Event::DnsLatency(o) => {
-                if self.dns_history.len() == DNS_HISTORY {
-                    self.dns_history.pop_front();
-                }
-                self.dns_history.push_back(o.clone());
+                self.dns_history.push(env.at, o.clone());
             }
             Event::Finding(f) => match f.lifecycle {
                 FindingLifecycle::Resolved => {
@@ -279,6 +278,15 @@ impl AppState {
             Event::InterfaceCounters(o) => {
                 self.throughput.record(o, env.at);
                 self.latest_counters = Some(o.clone());
+                // Record the per-step rate (rate between this sample
+                // and the previous one) so the sparkline shows bursts
+                // and idle periods as visible shapes. This is distinct
+                // from `current_throughput()` which is the rolling
+                // average — that one drives the headline number.
+                if let Some(step) = self.throughput.step_throughput() {
+                    self.rx_throughput_history.push(env.at, step.rx_bps);
+                    self.tx_throughput_history.push(env.at, step.tx_bps);
+                }
             }
             Event::SensorHealth(h) => {
                 if h.sensor.as_str() == "wifi"
@@ -303,6 +311,8 @@ impl AppState {
                 {
                     self.throughput.forget();
                     self.latest_counters = None;
+                    self.rx_throughput_history.clear();
+                    self.tx_throughput_history.clear();
                 }
                 self.sensor_health.insert(h.sensor.clone(), h.clone());
             }
@@ -320,10 +330,7 @@ impl AppState {
             self.signal_history.clear();
         }
         if let Some(rssi) = obs.rssi_dbm {
-            if self.signal_history.len() == SIGNAL_HISTORY {
-                self.signal_history.pop_front();
-            }
-            self.signal_history.push_back(SignalSample { at, rssi_dbm: rssi });
+            self.signal_history.push(at, rssi);
         }
     }
 
@@ -348,12 +355,12 @@ impl AppState {
         let mut recent_n = 0i64;
         let mut prior_sum = 0i64;
         let mut prior_n = 0i64;
-        for s in &self.signal_history {
+        for s in self.signal_history.iter() {
             if s.at >= recent_start {
-                recent_sum += s.rssi_dbm as i64;
+                recent_sum += s.value as i64;
                 recent_n += 1;
             } else if s.at >= prior_start {
-                prior_sum += s.rssi_dbm as i64;
+                prior_sum += s.value as i64;
                 prior_n += 1;
             }
         }

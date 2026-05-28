@@ -9,6 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Wrap};
 use ratatui::Frame;
 use signalscope_analysis::{pressure_tier, PressureTier, Throughput};
+use signalscope_core::TemporalSeries;
 use signalscope_events::{
     BandClass, CorrelationFinding, DnsLatencyObservation, EventCategory, FindingLifecycle,
     GatewayLatencyObservation, NeighborAp, ObservationConfidence, SensorHealth, SensorState,
@@ -93,12 +94,14 @@ fn render_main(f: &mut Frame, area: Rect, state: &AppState) {
 
     // Left column: connected link / gateway / dns stack.
     // The connected-link card hosts longitudinal RF context (Held / Δ
-    // RSSI / sparkline) and the path-throughput line — one row for
-    // each, plus a small sparkline.
+    // RSSI / sparkline) plus throughput as duplex sparklines. Three
+    // single-row sparkline tracks at the bottom — RSSI, RX, TX — sit
+    // under seven text lines, with a one-row banner reserved on top
+    // for sensor health.
     let left = Layout::new(
         Direction::Vertical,
         [
-            Constraint::Length(12),
+            Constraint::Length(13),
             Constraint::Length(7),
             Constraint::Min(5),
         ],
@@ -265,26 +268,86 @@ fn render_wifi_card(f: &mut Frame, area: Rect, state: &AppState) {
     // RSSI sparkline lives at the bottom. If history is empty, skip the
     // sparkline so the card doesn't show a flat baseline that looks like
     // a dead reading.
-    if !state.signal_history.is_empty() {
-        let split = Layout::new(
-            Direction::Vertical,
-            [Constraint::Min(lines.len() as u16), Constraint::Length(1)],
-        )
-        .split(body_area);
-        f.render_widget(Paragraph::new(lines), split[0]);
-        let data: Vec<u64> = state
-            .signal_history
-            .iter()
-            .map(|s| rssi_to_sparkline_height(s.rssi_dbm))
-            .collect();
+    // The connected-link card stacks, from top to bottom:
+    //   text lines (RSSI/SNR/PHY/Held/RX/TX), then up to three single-row
+    //   sparklines (RSSI, RX, TX). Each sparkline is only drawn when its
+    //   history is non-empty — an empty flat baseline reads as a dead
+    //   signal and we want absence to look like absence.
+    let rssi_data: Vec<u64> = state
+        .signal_history
+        .iter_values()
+        .copied()
+        .map(rssi_to_sparkline_height)
+        .collect();
+    let rx_data = throughput_sparkline_data(&state.rx_throughput_history);
+    let tx_data = throughput_sparkline_data(&state.tx_throughput_history);
+
+    let want_rssi = !rssi_data.is_empty();
+    let want_rx = !rx_data.is_empty();
+    let want_tx = !tx_data.is_empty();
+    let spark_rows: u16 = (want_rssi as u16) + (want_rx as u16) + (want_tx as u16);
+
+    if spark_rows == 0 {
+        f.render_widget(Paragraph::new(lines), body_area);
+        return;
+    }
+
+    let mut constraints = vec![Constraint::Min(lines.len() as u16)];
+    for _ in 0..spark_rows {
+        constraints.push(Constraint::Length(1));
+    }
+    let split = Layout::new(Direction::Vertical, constraints).split(body_area);
+    f.render_widget(Paragraph::new(lines), split[0]);
+
+    let mut idx = 1usize;
+    if want_rssi {
         let spark = Sparkline::default()
-            .data(&data)
+            .data(&rssi_data)
             .style(Style::default().fg(rssi_color))
             .bar_set(symbols::bar::NINE_LEVELS);
-        f.render_widget(spark, split[1]);
-    } else {
-        f.render_widget(Paragraph::new(lines), body_area);
+        f.render_widget(spark, split[idx]);
+        idx += 1;
     }
+    if want_rx {
+        let spark = Sparkline::default()
+            .data(&rx_data)
+            .style(Style::default().fg(theme::INFO_FG))
+            .bar_set(symbols::bar::NINE_LEVELS);
+        f.render_widget(spark, split[idx]);
+        idx += 1;
+    }
+    if want_tx {
+        let spark = Sparkline::default()
+            .data(&tx_data)
+            .style(Style::default().fg(theme::OK_FG))
+            .bar_set(symbols::bar::NINE_LEVELS);
+        f.render_widget(spark, split[idx]);
+    }
+}
+
+/// Project a bits-per-second series into the 0..=100 sparkline bar
+/// range. Uses log10 scaling because throughput spans many orders of
+/// magnitude (a Kbps trickle and a Gbps burst on the same row); log
+/// scaling preserves the *shape* of the activity instead of letting
+/// one spike flatten everything else into invisibility.
+fn throughput_sparkline_data(series: &signalscope_core::TemporalSeries<f64>) -> Vec<u64> {
+    if series.is_empty() {
+        return Vec::new();
+    }
+    series
+        .iter_values()
+        .copied()
+        .map(|bps| {
+            if bps < 1.0 {
+                0
+            } else {
+                // log10(bps) maps 1 kbps→3, 1 Mbps→6, 1 Gbps→9 — scale
+                // by 10 so a Gbps burst tops out near 90.
+                let scaled = (bps.log10() * 10.0).clamp(0.0, 100.0);
+                scaled as u64
+            }
+        })
+        .collect()
 }
 
 /// Map a raw RSSI (dBm) into the 0..=90 sparkline bar-height range. We
@@ -296,9 +359,11 @@ fn rssi_to_sparkline_height(rssi_dbm: i32) -> u64 {
 }
 
 /// Compact path-throughput line for the connected-link card. Shows
-/// derived RX/TX rate and cumulative error counts side by side. When
-/// the derivation isn't ready yet (one or zero samples) renders a
-/// placeholder rather than a confidently wrong zero.
+/// derived RX/TX rate, a short temporal phrase ("bursting 6s" / "idle
+/// 1m12s") that names how long the current activity regime has held,
+/// and cumulative error counts. When the rate derivation isn't ready
+/// (one or zero samples) the row reads as a placeholder rather than
+/// a confidently wrong zero.
 fn throughput_line<'a>(state: &'a AppState) -> Line<'a> {
     let mut spans = vec![label("RX/TX")];
     match state.current_throughput() {
@@ -313,6 +378,10 @@ fn throughput_line<'a>(state: &'a AppState) -> Line<'a> {
         None => {
             spans.push(Span::styled("—  /  —", theme::dim()));
         }
+    }
+    if let Some((phrase, color)) = throughput_stance(state) {
+        spans.push(Span::styled("  · ", theme::dim()));
+        spans.push(Span::styled(phrase, Style::default().fg(color)));
     }
     spans.push(Span::raw("    "));
     spans.push(label("errs"));
@@ -332,6 +401,69 @@ fn throughput_line<'a>(state: &'a AppState) -> Line<'a> {
         None => spans.push(Span::styled("—/—", theme::dim())),
     }
     Line::from(spans)
+}
+
+/// Classify the recent throughput history into an activity regime
+/// (idle / trickling / sustained / bursting) and report how long that
+/// regime has been holding. The regime is anchored on the latest
+/// step rate; we then walk back through history while the regime
+/// matches. This reads as persistence ("idle 1m20s") rather than
+/// instantaneous state, which is the temporal stance the dashboard
+/// wants to surface.
+fn throughput_stance(state: &AppState) -> Option<(String, ratatui::style::Color)> {
+    let last_rx = state.rx_throughput_history.latest()?;
+    let last_tx = state.tx_throughput_history.latest()?;
+    let regime = throughput_regime(last_rx.value, last_tx.value);
+
+    let mut anchor = last_rx.at;
+    let pairs = state
+        .rx_throughput_history
+        .iter()
+        .rev()
+        .zip(state.tx_throughput_history.iter().rev());
+    for (rx, tx) in pairs.skip(1) {
+        if throughput_regime(rx.value, tx.value) != regime {
+            break;
+        }
+        anchor = rx.at;
+    }
+    let secs = (last_rx.at - anchor).whole_seconds().max(0) as u64;
+    if secs < 3 {
+        return None;
+    }
+    let dur = humanize_duration(std::time::Duration::from_secs(secs));
+    let (phrase, color) = match regime {
+        ThroughputRegime::Idle => (format!("idle {dur}"), theme::DIM_FG),
+        ThroughputRegime::Trickle => (format!("trickling {dur}"), theme::DIM_FG),
+        ThroughputRegime::Sustained => (format!("sustained {dur}"), theme::INFO_FG),
+        ThroughputRegime::Bursting => (format!("bursting {dur}"), theme::OK_FG),
+    };
+    Some((phrase, color))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThroughputRegime {
+    /// Both directions below the kbps floor.
+    Idle,
+    /// Modest activity — DNS, ARP, keepalives — but no real transfer.
+    Trickle,
+    /// Steady use, on the order of streaming video.
+    Sustained,
+    /// A spike well above the recent baseline.
+    Bursting,
+}
+
+fn throughput_regime(rx_bps: f64, tx_bps: f64) -> ThroughputRegime {
+    let peak = rx_bps.max(tx_bps);
+    if peak < 50_000.0 {
+        ThroughputRegime::Idle
+    } else if peak < 500_000.0 {
+        ThroughputRegime::Trickle
+    } else if peak < 25_000_000.0 {
+        ThroughputRegime::Sustained
+    } else {
+        ThroughputRegime::Bursting
+    }
 }
 
 /// Format a bits-per-second rate with a tight unit. Stays inside one
@@ -431,8 +563,7 @@ fn render_gateway_card(f: &mut Frame, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let samples: Vec<&GatewayLatencyObservation> = state.gateway_history.iter().collect();
-    if samples.is_empty() {
+    if state.gateway_history.is_empty() {
         f.render_widget(
             Paragraph::new("no data — awaiting first probe").style(theme::dim()),
             inner,
@@ -446,6 +577,8 @@ fn render_gateway_card(f: &mut Frame, area: Rect, state: &AppState) {
     )
     .split(inner);
 
+    let samples: Vec<&GatewayLatencyObservation> =
+        state.gateway_history.iter_values().collect();
     let target = samples.last().map(|s| s.target.as_str()).unwrap_or("—");
     let median = median_rtt(&samples).unwrap_or(0.0);
     let p95 = p95_rtt(&samples).unwrap_or(0.0);
@@ -460,7 +593,14 @@ fn render_gateway_card(f: &mut Frame, area: Rect, state: &AppState) {
     let goodness = rtt_goodness(median, 5.0, 40.0);
     let color = theme::quality_color(goodness);
 
-    let summary = Line::from(vec![
+    // Temporal stance — how long has the current "good" or "spiking"
+    // condition been holding? The phrase is anchored on the latest
+    // sample so the operator reads the *current* state, not a global
+    // average. Cheap to compute: walk back while reachability and the
+    // p95-band membership stay the same as the latest sample.
+    let stance = gateway_stance(&state.gateway_history, median);
+
+    let mut summary_spans = vec![
         Span::styled(target.to_string(), theme::value()),
         Span::styled("  last ", theme::dim()),
         Span::styled(last_str, Style::default().fg(color)),
@@ -470,8 +610,12 @@ fn render_gateway_card(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled(format!("{p95:.1} ms"), theme::value()),
         Span::styled("  loss ", theme::dim()),
         Span::styled(format!("{loss:.0}%"), theme::value()),
-    ]);
-    f.render_widget(Paragraph::new(summary), layout[0]);
+    ];
+    if let Some((phrase, phrase_color)) = stance {
+        summary_spans.push(Span::styled("   · ", theme::dim()));
+        summary_spans.push(Span::styled(phrase, Style::default().fg(phrase_color)));
+    }
+    f.render_widget(Paragraph::new(Line::from(summary_spans)), layout[0]);
 
     let data = sparkline_data(samples.iter().map(|s| {
         if s.reachable {
@@ -492,8 +636,7 @@ fn render_dns_card(f: &mut Frame, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let samples: Vec<&DnsLatencyObservation> = state.dns_history.iter().collect();
-    if samples.is_empty() {
+    if state.dns_history.is_empty() {
         f.render_widget(
             Paragraph::new("no data — awaiting first probe").style(theme::dim()),
             inner,
@@ -507,6 +650,7 @@ fn render_dns_card(f: &mut Frame, area: Rect, state: &AppState) {
     )
     .split(inner);
 
+    let samples: Vec<&DnsLatencyObservation> = state.dns_history.iter_values().collect();
     let resolver = samples
         .last()
         .map(|s| s.resolver.as_str())
@@ -523,7 +667,9 @@ fn render_dns_card(f: &mut Frame, area: Rect, state: &AppState) {
     let goodness = rtt_goodness(median, 15.0, 150.0).min(1.0 - (fail_pct / 100.0));
     let color = theme::quality_color(goodness);
 
-    let summary = Line::from(vec![
+    let stance = dns_stance(&state.dns_history);
+
+    let mut summary_spans = vec![
         Span::styled(resolver.to_string(), theme::value()),
         Span::styled("  last ", theme::dim()),
         Span::styled(last_str, Style::default().fg(color)),
@@ -531,8 +677,12 @@ fn render_dns_card(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled(format!("{median:.0} ms"), theme::value()),
         Span::styled("  fail ", theme::dim()),
         Span::styled(format!("{fail_pct:.0}%"), theme::value()),
-    ]);
-    f.render_widget(Paragraph::new(summary), layout[0]);
+    ];
+    if let Some((phrase, phrase_color)) = stance {
+        summary_spans.push(Span::styled("   · ", theme::dim()));
+        summary_spans.push(Span::styled(phrase, Style::default().fg(phrase_color)));
+    }
+    f.render_widget(Paragraph::new(Line::from(summary_spans)), layout[0]);
 
     let data = sparkline_data(samples.iter().map(|s| {
         if s.answered {
@@ -1003,6 +1153,103 @@ fn lifecycle_glyph(state: FindingLifecycle) -> (&'static str, ratatui::style::Co
         FindingLifecycle::Recovering => ("↓", theme::WARN_FG),
         FindingLifecycle::Resolved => ("○", theme::OK_FG),
     }
+}
+
+/// Walk back through the gateway history while reachability and the
+/// "above/below median" stance hold steady, returning a phrase that
+/// names the current condition and how long it's been holding. The
+/// goal is to surface persistence — "stable 2m12s", "spiking 8s" —
+/// rather than the bare current value the rest of the row already
+/// shows. `None` for very short or noisy runs where the phrase would
+/// be misleading.
+fn gateway_stance(
+    history: &TemporalSeries<GatewayLatencyObservation>,
+    median_ms: f64,
+) -> Option<(String, ratatui::style::Color)> {
+    let last = history.latest()?;
+    let last_ms = last.value.rtt.as_secs_f64() * 1000.0;
+
+    // Classify the current sample into one of three stances.
+    let stance = if !last.value.reachable {
+        Stance::Lost
+    } else if last_ms > median_ms * 1.5 + 5.0 {
+        Stance::Elevated
+    } else {
+        Stance::Stable
+    };
+
+    // Walk back while the stance matches.
+    let mut anchor = last.at;
+    for sample in history.iter().rev().skip(1) {
+        let ms = sample.value.rtt.as_secs_f64() * 1000.0;
+        let same = match stance {
+            Stance::Lost => !sample.value.reachable,
+            Stance::Elevated => sample.value.reachable && ms > median_ms * 1.5 + 5.0,
+            Stance::Stable => sample.value.reachable && ms <= median_ms * 1.5 + 5.0,
+        };
+        if !same {
+            break;
+        }
+        anchor = sample.at;
+    }
+    let secs = (last.at - anchor).whole_seconds().max(0) as u64;
+    if secs < 3 {
+        return None;
+    }
+    let dur = humanize_duration(std::time::Duration::from_secs(secs));
+    Some(match stance {
+        Stance::Lost => (format!("unreachable {dur}"), theme::BAD_FG),
+        Stance::Elevated => (format!("spiking {dur}"), theme::WARN_FG),
+        Stance::Stable => (format!("stable {dur}"), theme::DIM_FG),
+    })
+}
+
+/// Same idea as [`gateway_stance`] for DNS: name the current
+/// answered/failed stance and how long it's been holding. Failures
+/// dominate; once a single FAIL appears we surface that until the
+/// run of failures ends.
+fn dns_stance(
+    history: &TemporalSeries<DnsLatencyObservation>,
+) -> Option<(String, ratatui::style::Color)> {
+    let last = history.latest()?;
+    let stance = if !last.value.answered {
+        DnsStance::Failing
+    } else {
+        DnsStance::Answering
+    };
+    let mut anchor = last.at;
+    for sample in history.iter().rev().skip(1) {
+        let same = match stance {
+            DnsStance::Failing => !sample.value.answered,
+            DnsStance::Answering => sample.value.answered,
+        };
+        if !same {
+            break;
+        }
+        anchor = sample.at;
+    }
+    let secs = (last.at - anchor).whole_seconds().max(0) as u64;
+    if secs < 3 {
+        return None;
+    }
+    let dur = humanize_duration(std::time::Duration::from_secs(secs));
+    Some(match stance {
+        DnsStance::Failing => (format!("failing {dur}"), theme::BAD_FG),
+        DnsStance::Answering => (format!("answering {dur}"), theme::DIM_FG),
+    })
+}
+
+#[derive(Clone, Copy)]
+enum Stance {
+    Lost,
+    Elevated,
+    Stable,
+}
+
+#[derive(Clone, Copy)]
+enum DnsStance {
+    Failing,
+    Answering,
 }
 
 fn humanize_duration(d: std::time::Duration) -> String {

@@ -23,7 +23,8 @@ A Cargo workspace with five crates:
   types. The lingua franca of the system.
 - `signalscope-core` — append-only in-memory event bus (broadcast +
   bounded backlog), clock abstraction, tracing setup, session
-  recorder/reader, `EventSource` abstraction.
+  recorder/reader, `EventSource` abstraction, `TemporalSeries`
+  rolling-history primitive.
 - `signalscope-sensors` — `Sensor` trait + per-source adapters. Currently:
   Wi-Fi (macOS, primary backend `system_profiler -xml SPAirPortDataType`,
   legacy `airport` retained as a fallback for pre-Sonoma hosts), gateway
@@ -210,6 +211,62 @@ Arg parsing is hand-rolled; no `clap` dependency. The intent is
 non-technical collection and portable diagnostics, not a daemon
 platform.
 
+### Rolling-history primitive
+
+`signalscope-core::TemporalSeries<T>` is a deliberately small bounded
+wall-clock-timestamped sample window. Capacity is by count
+(predictable memory; matches sparkline pixel width); timestamps are
+wall-clock `OffsetDateTime` (replay-friendly — a series rebuilt from
+a recorded envelope stream renders identically to one built live).
+The primitive backs gateway / DNS / RSSI / RX / TX visual history
+inside the TUI; the same shape will work for any future rolling-
+visualization need without growing a metrics framework. Helpers
+worth knowing: `span()`, `elapsed_since_last(now)`, `mean_over(d,
+now)` on `f64` series, `max_value()` on ordered series.
+
+This is the only state-shape primitive in `core`. Analysis still owns
+its own typed rolling windows because they encapsulate domain math
+(trend-half deltas, monotonic-counter resets) — `TemporalSeries` is
+the *visual* history layer, not a replacement for those.
+
+### Temporal dashboard stance
+
+The dashboard is increasingly worded in terms of *what is changing*
+rather than *what is*:
+
+- **Connected link** — three single-row sparklines stacked under the
+  text (RSSI, RX rate, TX rate). RX/TX use a log10 scale so a Kbps
+  trickle and a Gbps burst share a row without one flattening the
+  other into invisibility. The throughput row carries a one-phrase
+  regime callout ("idle 1m12s" / "trickling 24s" / "sustained 8s" /
+  "bursting 6s") computed by walking the rate history backwards while
+  the regime classifier (`Idle/Trickle/Sustained/Bursting`) stays
+  steady on each pair.
+- **Gateway latency** — `gateway_stance` walks history back while
+  reachability and the "median+50%+5 ms" stance hold, emitting
+  `stable 2m12s` / `spiking 8s` / `unreachable 45s` as a tail span on
+  the summary row. Below ~3 s the phrase is suppressed; persistence
+  is the signal.
+- **DNS latency** — `dns_stance` does the same for answered/failing
+  runs.
+- **RF environment** — already trend-aware via the
+  `RfDensityTrend` finding; left as-is.
+
+Across the dashboard the operator should be able to identify bursts,
+sustained transfers, idle periods, saturation, and recovery by
+*shape* before reading any number.
+
+### Per-step vs averaged throughput
+
+`InterfaceThroughputWindow` exposes two views. `throughput_bps()` is
+the rolling average over the entire retained window — the right
+shape for the headline number. `step_throughput()` returns the rate
+between only the last two samples — the right shape for sparkline
+bars, because a sustained transfer reads as a plateau, a burst as a
+single tall bar, idle as zero. The TUI uses `throughput_bps()` for
+the headline RX/TX numbers and `step_throughput()` for the per-step
+samples pushed into the RX/TX rolling series.
+
 ### Interface counters & throughput
 
 A fourth sensor (`iface`) follows the default-route interface and
@@ -293,6 +350,92 @@ The TUI owns the terminal, so logs go to a rotating file under
 ---
 
 ## Resolved Dragons and Pivots
+
+### 2026-05-28 — Claude Opus 4.7 (temporal observatory: TemporalSeries, RX/TX sparklines, stance phrases)
+
+**Demoted from Canon, verbatim:**
+
+> - `signalscope-core` — append-only in-memory event bus (broadcast +
+>   bounded backlog), clock abstraction, tracing setup, session
+>   recorder/reader, `EventSource` abstraction.
+
+**Goal.** Make the dashboard show *how the environment is changing*
+rather than *what the latest reading is*. The project had been
+collecting richer data than it was visualizing: throughput existed
+as numbers, gateway/DNS history existed as sparklines without
+persistence-aware framing, and the connected-link card answered
+"what is RSSI" but not "what has the path been doing."
+
+**Pivot.** A small shared rolling-history primitive in `core`, a
+duplex throughput sparkline, and a vocabulary of "stance" phrases
+that name the current regime and how long it's held.
+
+**Primitive — `signalscope-core::TemporalSeries<T>`.** Bounded by
+sample count; each sample carries a wall-clock `OffsetDateTime` so
+the same series can be reconstructed from a recorded session and
+rendered identically (replay-friendly without a replay UI). Has
+`push`, `iter`, `iter_values`, `values`, `latest`, `earliest`,
+`span`, `elapsed_since_last`, `clear`. `mean_over(d, now)` for
+`f64`; `max_value()` for `T: PartialOrd`. Eight unit tests pin
+capacity eviction, zero-capacity degradation, span semantics,
+mean-over windowing, max-value, and chronological snapshot order.
+
+The TUI's previously ad-hoc `VecDeque` history collections
+(`gateway_history`, `dns_history`, `signal_history`) all moved
+onto this. Each sample now carries `env.at` rather than dropping
+its timestamp. The bespoke `SignalSample` struct is gone —
+`TemporalSeries<i32>` covers it.
+
+**Per-step throughput.** `InterfaceThroughputWindow::step_throughput`
+returns the rate between only the last two samples — the bursty
+view sparklines should feed off. The headline RX/TX number keeps
+using `throughput_bps()` (rolling average) so the *summary* stays
+calm. New test `step_throughput_uses_only_last_pair` pins the
+shape: in a quiet window followed by one full burst sample, step
+≫ avg.
+
+**RX/TX sparklines.** The Connected-link card now stacks three
+single-row sparklines under its text: RSSI (existing), RX rate,
+TX rate. RX/TX use a log10 scale (`log10(bps) × 10`, clamped
+0–100) because throughput legitimately spans many orders of
+magnitude on the same row — log scaling preserves the *shape* of
+the activity instead of letting one spike flatten everything else
+into invisibility. The card grew from 12 to 13 rows so a banner
++ all three sparklines + 7 text lines fit cleanly.
+
+**Stance phrases.** Three new lightweight regime classifiers:
+
+- `throughput_stance` — `Idle / Trickling / Sustained / Bursting`
+  based on the per-step peak rate (50 Kbps / 500 Kbps / 25 Mbps
+  cutoffs). Walks the RX/TX series back in lockstep while the
+  regime holds, emits `idle 1m12s` / `bursting 6s` / ….
+- `gateway_stance` — `Lost / Elevated / Stable` based on
+  reachability and "median + 50% + 5 ms". Emits `stable 2m12s` /
+  `spiking 8s` / `unreachable 45s`.
+- `dns_stance` — `Failing / Answering` runs. Emits `failing 12s` /
+  `answering 4m08s`.
+
+All three suppress the phrase under 3 s of held state — persistence
+is the signal; flickers are noise. Phrases hang off existing
+summary rows, never a separate line.
+
+**What this buys.**
+
+- The duplex RX/TX sparkline lets the operator see bursts,
+  sustained transfers, idle, and saturation by *shape* before
+  reading any number.
+- "stable 2m12s" on a flat gateway row makes the absence of drama
+  itself a signal. The opposite — "spiking 8s" — names the
+  beginning of a regime change before any rule fires.
+- The dashboard answers *what is changing* more often than *what
+  exists*.
+
+**Untouched.** Bus shape, lifecycle pipeline, sensors, observation
+confidence, macOS backend layering, trend rules, RF occupancy
+panel, finding fingerprints, session-recording format. Purely
+additive across every layer.
+
+`cargo test --workspace`: 58/58 green (up from 49).
 
 ### 2026-05-28 — Claude Opus 4.7 (interface counters + throughput)
 
