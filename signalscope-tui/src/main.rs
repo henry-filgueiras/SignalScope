@@ -19,6 +19,7 @@ use tracing::info;
 
 mod app;
 mod capture;
+mod inspect;
 mod theme;
 mod ui;
 
@@ -48,6 +49,11 @@ async fn main() -> Result<()> {
             init_logging_file();
             info!("signalscope capture starting");
             capture::run(opts).await
+        }
+        Command::Inspect(opts) => {
+            // No log file — inspect is a one-shot, runs in any terminal.
+            signalscope_core::logging::init_stderr();
+            inspect::run(opts).await
         }
     }
 }
@@ -98,6 +104,7 @@ enum Command {
     Help,
     Observe(ObserveOptions),
     Capture(capture::CaptureOptions),
+    Inspect(inspect::InspectOptions),
 }
 
 #[derive(Default)]
@@ -114,6 +121,7 @@ fn parse_args() -> Result<Command, String> {
         Some("-h") | Some("--help") | Some("help") => Ok(Command::Help),
         Some("observe") => Ok(Command::Observe(parse_observe(&mut args)?)),
         Some("capture") => Ok(Command::Capture(parse_capture(&mut args)?)),
+        Some("inspect") => Ok(Command::Inspect(parse_inspect(&mut args)?)),
         // Backward compat: bare flags after the program name behave like
         // `observe <flags>` so existing invocations keep working.
         Some(s) if s.starts_with('-') => {
@@ -147,6 +155,26 @@ fn parse_observe<I: Iterator<Item = String>>(args: &mut I) -> Result<ObserveOpti
     Ok(opts)
 }
 
+fn parse_inspect<I: Iterator<Item = String>>(args: &mut I) -> Result<inspect::InspectOptions, String> {
+    let mut path: Option<PathBuf> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => return Err("usage: signalscope inspect PATH".into()),
+            other if other.starts_with('-') => {
+                return Err(format!("unknown inspect option: {other}"))
+            }
+            other => {
+                if path.is_some() {
+                    return Err(format!("unexpected extra argument: {other}"));
+                }
+                path = Some(PathBuf::from(other));
+            }
+        }
+    }
+    let path = path.ok_or_else(|| "inspect requires a PATH argument".to_string())?;
+    Ok(inspect::InspectOptions { path })
+}
+
 fn parse_capture<I: Iterator<Item = String>>(args: &mut I) -> Result<capture::CaptureOptions, String> {
     let mut output: Option<PathBuf> = None;
     let mut label: Option<String> = None;
@@ -177,16 +205,21 @@ fn print_usage() {
          USAGE:\n  \
              signalscope [observe] [--record PATH] [--label TEXT]\n  \
              signalscope capture --output PATH [--label TEXT]\n  \
+             signalscope inspect PATH\n  \
              signalscope help\n\
          \n\
          observe    Run the live TUI dashboard. Default subcommand.\n           \
                     --record  also writes every event to PATH as a JSONL session.\n  \
          capture    Headless recording — sensors run, events stream to PATH,\n           \
-                    periodic stderr status. No TUI. Ctrl-C to stop.\n\
+                    periodic stderr status. No TUI. Ctrl-C to stop.\n  \
+         inspect    Print a one-screen summary of a recorded session — kind,\n           \
+                    format version, span, per-category event tally. Verifies\n           \
+                    a handed-off `.signalscope-session` file end-to-end.\n\
          \n\
          The session file (`.signalscope-session`) is an append-only newline-\n\
          delimited JSON stream: first line is a version header, every later\n\
-         line is one envelope as published by the bus."
+         line is one envelope as published by the bus. Timestamps are RFC 3339\n\
+         strings; inspect with `jq -r '.at'` on any modern shell."
     );
 }
 

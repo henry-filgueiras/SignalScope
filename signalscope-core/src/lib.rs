@@ -18,7 +18,8 @@ pub use bus::{EventBus, Subscription};
 pub use clock::{Clock, SystemClock};
 pub use series::{TemporalSample, TemporalSeries};
 pub use session::{
-    spawn_recorder, SessionHeader, SessionReadError, SessionReader, SessionRow, SessionWriter,
-    SESSION_FORMAT_VERSION, SESSION_KIND,
+    spawn_recorder, summarize as summarize_session, SessionHeader, SessionReadError, SessionReader,
+    SessionRow, SessionStats, SessionWriter, SESSION_FORMAT_VERSION, SESSION_KIND,
+    SESSION_MIN_READABLE_VERSION,
 };
 pub use source::{EventSource, FileEventSource};

@@ -278,9 +278,15 @@ pub enum EventCategory {
 
 /// Envelope written to the event bus. Once published the envelope is treated
 /// as immutable — consumers receive cheap `Arc<Envelope>` clones.
+///
+/// `at` serializes as an RFC 3339 string (e.g. `"2026-05-28T17:16:57Z"`)
+/// rather than the default `time` tuple. This is the canonical recording
+/// shape: a `.signalscope-session` file should be readable with `jq`
+/// without operator knowledge of internal field orders.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
     pub id: EventId,
+    #[serde(with = "time::serde::rfc3339")]
     pub at: Timestamp,
     pub source: SensorId,
     pub event: Event,

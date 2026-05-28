@@ -158,29 +158,70 @@ only see normalized `WifiObservation` / `NeighborAp` / `SensorHealth`.
 The TUI's Wi-Fi card title surfaces the active backend so the operator
 can tell, but no code path outside `wifi/macos/` branches on it.
 
-### Session recording
+### Session recording (canonical format v2)
 
-A single run can be preserved as a `.signalscope-session` file: append-
+A single run is preserved as a `.signalscope-session` file: append-
 only newline-delimited JSON, first line a versioned `SessionHeader`,
 every subsequent line one `SessionRow::Envelope` carrying a published
 bus envelope verbatim. The recorder is one async task that subscribes
 to the bus (backlog included, in order) and writes through a
 `BufWriter<File>` with a per-row `flush()` — an abrupt kill loses at
-most the most recent observation, never the tail. The format is
-deliberately:
+most the most recent observation, never the tail.
+
+Header (v2 sample):
+
+```json
+{"row":"header","kind":"signalscope-session","format_version":2,
+ "created_at":"2026-05-28T19:23:13.381101Z","tool_version":"0.1.0",
+ "label":"canonical-test"}
+```
+
+Envelope:
+
+```json
+{"row":"envelope","id":4,"at":"2026-05-28T19:23:13.412587Z",
+ "source":"dns","event":{"type":"DnsLatency", … }}
+```
+
+Format guarantees:
 
 - **Append-only** — rows are never rewritten.
-- **Inspectable** — `tail -f`, `jq`, `wc -l` all work; not a database,
-  not binary, not compressed (yet).
-- **Versioned** — `SESSION_FORMAT_VERSION` is checked on read; future-
-  newer files are rejected rather than silently misinterpreted, and
-  the reader tolerates unknown header fields so writers can grow.
+- **Inspectable** — `tail -f`, `jq`, `wc -l` all just work. Timestamps
+  are RFC 3339 strings, so `jq -r '.at'` returns a date. Not a
+  database, not binary, not compressed.
+- **Versioned** — both `SESSION_FORMAT_VERSION` (current = 2) and
+  `SESSION_MIN_READABLE_VERSION` (= 2) are checked on read.
+  Future-newer files surface `UnsupportedNewerVersion`; legacy v1
+  files (tuple timestamps, never shipped) surface
+  `UnsupportedOlderVersion`. Header parsing is two-phase: kind +
+  version are validated against the raw JSON value first, so
+  legacy files report a useful error instead of a deep serde
+  shape failure. Unknown header fields are tolerated so writers
+  can grow non-breakingly.
 - **Semantically faithful** — what the bus carries is what gets
-  recorded, including lifecycle transitions, observation confidence,
-  sensor-health distinctions, and monotonic `EventId`s.
+  recorded: observations, scans, gateway/DNS probes, interface
+  counters, interface state changes, roams, correlation findings
+  with their full lifecycle edges, sensor-health events. Monotonic
+  `EventId`s and wall-clock `at` survive round-trip exactly.
 
 `SessionRow` is a tagged enum so future row kinds (replay markers,
 operator notes) can land without breaking the existing shape.
+
+`SessionStats` + `signalscope-core::summarize_session(path)` walk a
+file once and return a lightweight per-category tally + time span,
+without holding the envelope stream in memory. This is the data
+shape the `inspect` subcommand reads off.
+
+### `signalscope inspect`
+
+`signalscope inspect PATH` is the canonical "did the recording
+survive the handoff?" verifier. It prints, in one screen, the file
+metadata (kind, format version, tool version, label, created_at),
+the wall-clock span of the recording, and a per-category event
+tally (wifi / scan / gateway / dns / iface_counter / iface_state /
+roam / findings / sensor_health). No TUI, no replay, no analysis —
+just the smallest tool that confirms a `.signalscope-session` file
+is what the recipient thinks it is.
 
 ### Event source abstraction
 
@@ -201,6 +242,7 @@ The `signalscope` binary now dispatches on subcommand:
   same time, so the operator can promote a live observation into a
   permanent artifact without restarting. The bare invocation (no
   subcommand) still means `observe`, so existing muscle memory holds.
+- `signalscope inspect PATH` — one-shot verifier (see above).
 - `signalscope capture --output PATH` — headless recording. Same
   sensor + analysis pipeline, no ratatui. Emits a one-line stderr
   status every 5 s (`wifi=… scan=… gw=… dns=… find=… health=…`) so
@@ -350,6 +392,127 @@ The TUI owns the terminal, so logs go to a rotating file under
 ---
 
 ## Resolved Dragons and Pivots
+
+### 2026-05-28 — Claude Opus 4.7 (canonical recording format v2, inspect)
+
+**Demoted from Canon, verbatim:**
+
+> ### Session recording
+>
+> A single run can be preserved as a `.signalscope-session` file: append-
+> only newline-delimited JSON, first line a versioned `SessionHeader`,
+> every subsequent line one `SessionRow::Envelope` carrying a published
+> bus envelope verbatim. The recorder is one async task that subscribes
+> to the bus (backlog included, in order) and writes through a
+> `BufWriter<File>` with a per-row `flush()` — an abrupt kill loses at
+> most the most recent observation, never the tail. The format is
+> deliberately:
+>
+> - **Append-only** — rows are never rewritten.
+> - **Inspectable** — `tail -f`, `jq`, `wc -l` all work; not a database,
+>   not binary, not compressed (yet).
+> - **Versioned** — `SESSION_FORMAT_VERSION` is checked on read; future-
+>   newer files are rejected rather than silently misinterpreted, and
+>   the reader tolerates unknown header fields so writers can grow.
+> - **Semantically faithful** — what the bus carries is what gets
+>   recorded, including lifecycle transitions, observation confidence,
+>   sensor-health distinctions, and monotonic `EventId`s.
+>
+> `SessionRow` is a tagged enum so future row kinds (replay markers,
+> operator notes) can land without breaking the existing shape.
+
+**Goal.** Promote the existing `.signalscope-session` shape into the
+*canonical* observability recording format: portable enough to hand
+to another person, inspectable enough to verify by eye, versioned
+strictly enough that older readers refuse newer files (and vice
+versa) instead of misinterpreting them.
+
+**Canonical inspectability — RFC 3339 timestamps.** The dominant
+ergonomic problem in v1 was the default `time` crate tuple form for
+`OffsetDateTime`: `created_at: [2026, 148, 17, 16, 50, ...]`.
+`jq -r '.at'` returned a nine-element array. Anybody not already
+inside the codebase had no way to know what position the year was in.
+
+Switched `Envelope::at` and `SessionHeader::created_at` to
+`#[serde(with = "time::serde::rfc3339")]`, enabled the
+`serde-well-known` + `parsing` features on the workspace `time`
+dep. Both fields now emit ISO-8601 strings:
+`"2026-05-28T19:23:13.412587Z"`. `jq -r '.at'` returns a date.
+
+This is a backwards-incompatible on-disk change. Bumped
+`SESSION_FORMAT_VERSION` from 1 to 2 and added a
+`SESSION_MIN_READABLE_VERSION = 2` so legacy v1 files (only ever
+created during initial development) are rejected with a clear
+`UnsupportedOlderVersion` error rather than blowing up deep in
+serde with "invalid type: sequence, expected an RFC 3339-formatted
+OffsetDateTime."
+
+**Two-phase header parse.** The version check has to run *before*
+strict deserialization, or the timestamp-shape failure wins. The
+reader now parses the first line as `serde_json::Value`, validates
+`kind` and `format_version` against the raw map, and only then
+deserializes to the strict `SessionHeader` shape. Same JSON parse
+cost in the happy path, dramatically better error messages on the
+sad paths.
+
+**SessionStats + summarize_session.** New tiny type in `core::session`
+that aggregates a per-category envelope tally and the
+first/last timestamps over a session. The walker is one pass, never
+buffers the envelope stream. Exposed as `signalscope_core::
+summarize_session(path) -> (SessionHeader, SessionStats)`.
+
+**`signalscope inspect PATH` subcommand.** New module
+`signalscope-tui/src/inspect.rs`. Reads the session, prints a
+one-screen summary (header metadata, span, first/last event
+timestamps, per-category counts). No TUI, no replay, no analysis —
+the smallest tool that confirms a handed-off `.signalscope-session`
+file is what the recipient thinks it is. CLI usage updated, help
+text mentions the RFC 3339 timestamp inspectability.
+
+**Test coverage — explicitly broadened for canonical confidence.**
+Five new tests in `core::session::tests` on top of the previous
+five:
+
+- `timestamps_serialize_as_rfc3339_strings` — guard against a future
+  serde-attribute regression on either timestamp field. Asserts both
+  `created_at` and `at` deserialize as strings and look RFC-3339-ish.
+- `rejects_older_than_minimum_format_version` — legacy v1 files
+  surface `UnsupportedOlderVersion`, not a serde shape error.
+- `round_trip_handles_a_mixed_event_stream` — Scan + GatewayLatency
+  + DnsLatency (failed) + InterfaceCounters + Finding (Active
+  lifecycle with evidence + peak_confidence) + SensorHealth all
+  round-trip in publication order, with deep field equality on the
+  Finding and SensorHealth payloads.
+- `malformed_line_surfaces_a_bad_json_error_with_line_number` —
+  appends a garbage line between two valid envelopes; reader emits
+  `BadJson { line: 3, … }` for the bad row and continues on the
+  next.
+- `header_tolerates_unknown_fields_for_forward_compat` — header
+  with extra `hostname` + `operator` fields parses fine, so a
+  slightly-newer writer doesn't strand current readers as long as
+  the format_version is unchanged.
+
+Existing tests refactored: the previous `UnsupportedVersion` variant
+split into `UnsupportedNewerVersion` and `UnsupportedOlderVersion`
+so the two failure modes are nameable.
+
+**Smoke.** `signalscope capture --output /tmp/canonical.session
+--label canonical-test` for 11 s on this host produced a file with
+RFC-3339 timestamps end-to-end (`jq -r '.at'` printed dates), then
+`signalscope inspect` reported 23 envelopes / 11 s span / per-
+category tally (gateway 12 / dns 4 / iface_counter 6 / sensor_health
+1). The success-criteria flow (record → hand off → recipient can
+verify shape and content) works.
+
+**Untouched.** Bus shape, event-bus invariants, lifecycle pipeline,
+sensors, observation confidence, macOS backend layering, trend
+rules, RF occupancy panel, finding fingerprints, throughput
+plane, temporal series, dashboard stance phrases. All edits are
+contained to `events::Envelope` (serde attr on `at`),
+`core::session` (format bump + RFC 3339 + reader two-phase + stats),
+the binary's CLI dispatcher, and one new `inspect` module.
+
+`cargo test --workspace`: 63/63 green (up from 58).
 
 ### 2026-05-28 — Claude Opus 4.7 (temporal observatory: TemporalSeries, RX/TX sparklines, stance phrases)
 

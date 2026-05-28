@@ -1,26 +1,52 @@
-//! Append-only observability session recorder.
+//! Canonical observability session recording.
 //!
-//! A *session* is a single SignalScope run preserved as a portable, replayable
+//! A *session* is a single SignalScope run preserved as a portable
 //! artifact: a stream of newline-delimited JSON. The first line is a
 //! [`SessionHeader`]; every subsequent line is one [`SessionRow::Envelope`]
 //! carrying a published bus envelope verbatim.
 //!
-//! Design goals (in priority order):
+//! # On-disk shape (v2)
 //!
-//! 1. **Append-only.** A session is a temporal recording. Rows are never
-//!    rewritten and never reordered. `kill -9` may lose the tail; it must
-//!    never corrupt earlier rows.
-//! 2. **Inspectable.** `tail -f`, `jq`, `wc -l` should all just work. This is
-//!    intentionally not a database. No SQLite, no binary framing, no
-//!    compression — yet.
-//! 3. **Versioned.** A header line carries `format_version`. Readers refuse
-//!    files newer than they understand instead of silently misinterpreting
-//!    them. Writers may add header fields freely; readers tolerate unknown
-//!    fields.
-//! 4. **Semantically faithful.** Whatever the bus carries gets recorded, in
-//!    the same order, with the same timestamps. Lifecycle transitions,
-//!    observation confidence, sensor-health distinctions, monotonic event
-//!    ids — all preserved. No flattening to derived summaries.
+//! ```jsonc
+//! {"row":"header","kind":"signalscope-session","format_version":2,
+//!  "created_at":"2026-05-28T17:16:50Z","tool_version":"0.1.0","label":"…"}
+//! {"row":"envelope","id":1,"at":"2026-05-28T17:16:51Z","source":"wifi",
+//!  "event":{"type":"Wifi", … }}
+//! {"row":"envelope","id":2,"at":"2026-05-28T17:16:51Z","source":"gateway",
+//!  "event":{"type":"GatewayLatency", … }}
+//! …
+//! ```
+//!
+//! Two row variants: `header` (exactly once, line 1) and `envelope`
+//! (every other line). `SessionRow` is a tagged enum so future row
+//! kinds (replay markers, operator notes) can land without breaking
+//! existing readers.
+//!
+//! # Design goals (in priority order)
+//!
+//! 1. **Append-only.** A session is a temporal recording. Rows are
+//!    never rewritten and never reordered. `kill -9` may lose the
+//!    tail; it must never corrupt earlier rows.
+//! 2. **Inspectable.** `tail -f`, `jq`, `wc -l` all just work. ISO-8601
+//!    timestamps survive `jq -r '.at'`. Not a database; not binary; not
+//!    compressed.
+//! 3. **Versioned.** A header line carries `format_version`. Readers
+//!    refuse files they don't understand instead of silently
+//!    misinterpreting them. Writers may add header fields freely;
+//!    readers tolerate unknown fields.
+//! 4. **Semantically faithful.** Whatever the bus carries gets
+//!    recorded, in publication order, with wall-clock timestamps.
+//!    Observations, scans, gateway/DNS latency, interface counters,
+//!    interface state changes, roams, correlation findings (including
+//!    `Active`/`Escalating`/`Recovering`/`Resolved` lifecycle edges),
+//!    and sensor-health events all round-trip exactly.
+//!
+//! # Version history
+//!
+//! - **v1** — `OffsetDateTime` serialized as the default `time` crate
+//!   tuple form. Internal only; never shipped.
+//! - **v2** — `created_at` and envelope `at` switched to RFC 3339
+//!   strings for canonical inspectability. **Current.**
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -37,9 +63,18 @@ use signalscope_events::Envelope;
 use crate::bus::EventBus;
 
 /// Bump when the on-disk schema changes in a way readers cannot tolerate
-/// (e.g. a row shape changes incompatibly). Adding new optional fields does
-/// not require a bump.
-pub const SESSION_FORMAT_VERSION: u32 = 1;
+/// (e.g. a row shape changes incompatibly). Adding new optional fields
+/// to the header or new variants to `Event` does NOT require a bump —
+/// the reader tolerates unknown header fields and serde's tagged enum
+/// rejects unknown variants only at the row level (the rest of the
+/// session still reads).
+pub const SESSION_FORMAT_VERSION: u32 = 2;
+
+/// Oldest format version this reader will still accept. When the format
+/// makes a backwards-incompatible jump (like v1→v2's timestamp swap), set
+/// this to the new minimum and refuse anything older with a clear error
+/// instead of letting serde fail mysteriously deep in a row.
+pub const SESSION_MIN_READABLE_VERSION: u32 = 2;
 
 /// Discriminator written into every header so a stray JSONL file can be
 /// identified as a SignalScope session at a glance.
@@ -50,6 +85,7 @@ pub const SESSION_KIND: &str = "signalscope-session";
 pub struct SessionHeader {
     pub kind: String,
     pub format_version: u32,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     pub tool_version: String,
     /// Free-form operator label captured at recording time. Useful for
@@ -182,8 +218,14 @@ pub enum SessionReadError {
     MissingHeader,
     #[error("file is kind {found:?}, expected {expected:?}")]
     WrongKind { found: String, expected: &'static str },
-    #[error("session file format version {found} is newer than supported ({supported})")]
-    UnsupportedVersion { found: u32, supported: u32 },
+    #[error(
+        "session file format version {found} is newer than supported ({supported})"
+    )]
+    UnsupportedNewerVersion { found: u32, supported: u32 },
+    #[error(
+        "session file format version {found} is older than the minimum supported ({minimum})"
+    )]
+    UnsupportedOlderVersion { found: u32, minimum: u32 },
     #[error("malformed json on line {line}: {source}")]
     BadJson {
         line: usize,
@@ -208,24 +250,48 @@ impl SessionReader {
             }
         };
 
-        let row: SessionRow = serde_json::from_str(&first)
+        // Two-phase header parse so kind/version errors win over JSON
+        // shape errors. Otherwise a legacy file with v1 tuple timestamps
+        // surfaces as "invalid type: sequence" instead of the actual
+        // "format version is too old" story.
+        let raw: serde_json::Value = serde_json::from_str(&first)
+            .map_err(|source| SessionReadError::BadJson { line: 1, source })?;
+        match raw.get("row").and_then(|v| v.as_str()) {
+            Some("header") => {}
+            Some("envelope") => return Err(SessionReadError::MissingHeader),
+            _ => return Err(SessionReadError::MissingHeader),
+        }
+        if let Some(kind) = raw.get("kind").and_then(|v| v.as_str()) {
+            if kind != SESSION_KIND {
+                return Err(SessionReadError::WrongKind {
+                    found: kind.to_string(),
+                    expected: SESSION_KIND,
+                });
+            }
+        }
+        if let Some(v) = raw.get("format_version").and_then(|v| v.as_u64()) {
+            let v = v as u32;
+            if v > SESSION_FORMAT_VERSION {
+                return Err(SessionReadError::UnsupportedNewerVersion {
+                    found: v,
+                    supported: SESSION_FORMAT_VERSION,
+                });
+            }
+            if v < SESSION_MIN_READABLE_VERSION {
+                return Err(SessionReadError::UnsupportedOlderVersion {
+                    found: v,
+                    minimum: SESSION_MIN_READABLE_VERSION,
+                });
+            }
+        }
+
+        // kind + version validated; now do the strict shape parse.
+        let row: SessionRow = serde_json::from_value(raw)
             .map_err(|source| SessionReadError::BadJson { line: 1, source })?;
         let header = match row {
             SessionRow::Header(h) => h,
             SessionRow::Envelope(_) => return Err(SessionReadError::MissingHeader),
         };
-        if header.kind != SESSION_KIND {
-            return Err(SessionReadError::WrongKind {
-                found: header.kind,
-                expected: SESSION_KIND,
-            });
-        }
-        if header.format_version > SESSION_FORMAT_VERSION {
-            return Err(SessionReadError::UnsupportedVersion {
-                found: header.format_version,
-                supported: SESSION_FORMAT_VERSION,
-            });
-        }
         Ok(Self {
             header,
             lines,
@@ -236,6 +302,69 @@ impl SessionReader {
     pub fn header(&self) -> &SessionHeader {
         &self.header
     }
+}
+
+/// One-glance summary of a recorded session — enough to confirm a
+/// handed-off file is what the operator thinks it is, without loading
+/// the full envelope stream into memory anywhere downstream.
+#[derive(Debug, Clone, Default)]
+pub struct SessionStats {
+    pub envelope_count: u64,
+    pub first_at: Option<OffsetDateTime>,
+    pub last_at: Option<OffsetDateTime>,
+    pub wifi: u64,
+    pub scan: u64,
+    pub gateway: u64,
+    pub dns: u64,
+    pub iface: u64,
+    pub iface_state: u64,
+    pub roam: u64,
+    pub findings: u64,
+    pub health: u64,
+}
+
+impl SessionStats {
+    /// Wall-clock span the recording covers. `None` until at least one
+    /// envelope has been observed.
+    pub fn duration(&self) -> Option<std::time::Duration> {
+        let first = self.first_at?;
+        let last = self.last_at?;
+        let secs = (last - first).whole_seconds().max(0);
+        Some(std::time::Duration::from_secs(secs as u64))
+    }
+
+    fn observe(&mut self, env: &Envelope) {
+        self.envelope_count += 1;
+        if self.first_at.is_none() {
+            self.first_at = Some(env.at);
+        }
+        self.last_at = Some(env.at);
+        use signalscope_events::Event;
+        match &env.event {
+            Event::Wifi(_) => self.wifi += 1,
+            Event::Scan(_) => self.scan += 1,
+            Event::GatewayLatency(_) => self.gateway += 1,
+            Event::DnsLatency(_) => self.dns += 1,
+            Event::InterfaceCounters(_) => self.iface += 1,
+            Event::InterfaceStateChanged(_) => self.iface_state += 1,
+            Event::RoamDetected(_) => self.roam += 1,
+            Event::Finding(_) => self.findings += 1,
+            Event::SensorHealth(_) => self.health += 1,
+        }
+    }
+}
+
+/// Read a session end-to-end, returning the header and a summary of
+/// the envelopes inside. Cheap — touches every row but holds nothing
+/// in memory. Stops at the first parse error and surfaces it.
+pub fn summarize(path: impl AsRef<Path>) -> Result<(SessionHeader, SessionStats), SessionReadError> {
+    let mut reader = SessionReader::open(path)?;
+    let mut stats = SessionStats::default();
+    for envelope in &mut reader {
+        let envelope = envelope?;
+        stats.observe(&envelope);
+    }
+    Ok((reader.header.clone(), stats))
 }
 
 impl Iterator for SessionReader {
@@ -275,7 +404,9 @@ impl Iterator for SessionReader {
 mod tests {
     use super::*;
     use signalscope_events::{
-        DnsLatencyObservation, Event, EventId, GatewayLatencyObservation, SensorId,
+        Confidence, CorrelationFinding, DnsLatencyObservation, Event, EventId, FindingKind,
+        FindingLifecycle, GatewayLatencyObservation, InterfaceCountersObservation, ScanResult,
+        SensorHealth, SensorId, SensorState,
     };
     use std::time::Duration;
 
@@ -319,6 +450,47 @@ mod tests {
     }
 
     #[test]
+    fn timestamps_serialize_as_rfc3339_strings() {
+        // The canonical recording shape MUST emit ISO-8601 timestamps —
+        // operators inspecting a session with `jq -r '.at'` should get
+        // a date string, not a numeric tuple. This guard exists so a
+        // future serde-attribute regression on `Envelope::at` or
+        // `SessionHeader::created_at` is caught immediately.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rfc3339.session");
+        let writer = SessionWriter::create(&path, SessionHeader::new(None)).unwrap();
+        writer.record(&sample_envelope(1)).unwrap();
+        drop(writer);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut lines = raw.lines();
+        let header_line = lines.next().unwrap();
+        let env_line = lines.next().unwrap();
+
+        let header_json: serde_json::Value = serde_json::from_str(header_line).unwrap();
+        assert!(
+            header_json["created_at"].is_string(),
+            "created_at should be a string, got {}",
+            header_json["created_at"]
+        );
+
+        let env_json: serde_json::Value = serde_json::from_str(env_line).unwrap();
+        assert!(
+            env_json["at"].is_string(),
+            "envelope.at should be a string, got {}",
+            env_json["at"]
+        );
+        let at = env_json["at"].as_str().unwrap();
+        // RFC 3339 shape sanity-check — there's always a `T` separator
+        // and either `Z` or a `+`/`-` offset.
+        assert!(at.contains('T'), "no T separator in {at:?}");
+        assert!(
+            at.ends_with('Z') || at.contains('+') || at.matches('-').count() > 2,
+            "no zone marker in {at:?}"
+        );
+    }
+
+    #[test]
     fn rejects_file_with_no_header() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.session");
@@ -342,11 +514,37 @@ mod tests {
         std::fs::write(&path, format!("{line}\n")).unwrap();
 
         match SessionReader::open(&path) {
-            Err(SessionReadError::UnsupportedVersion { found, supported }) => {
+            Err(SessionReadError::UnsupportedNewerVersion { found, supported }) => {
                 assert_eq!(found, SESSION_FORMAT_VERSION + 1);
                 assert_eq!(supported, SESSION_FORMAT_VERSION);
             }
-            other => panic!("expected UnsupportedVersion, got {other:?}"),
+            other => panic!("expected UnsupportedNewerVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_older_than_minimum_format_version() {
+        // A pre-v2 file (legacy tuple timestamps) must be refused with a
+        // clear error rather than letting serde explode on `created_at`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ancient.session");
+        // We can't use SessionHeader::new — its created_at is RFC 3339.
+        // Hand-craft a v1-shaped header by JSON value.
+        let v1 = serde_json::json!({
+            "row": "header",
+            "kind": SESSION_KIND,
+            "format_version": SESSION_MIN_READABLE_VERSION - 1,
+            "created_at": [2026, 148, 17, 16, 50, 0, 0, 0, 0],
+            "tool_version": "0.0.0",
+        });
+        std::fs::write(&path, format!("{v1}\n")).unwrap();
+
+        match SessionReader::open(&path) {
+            Err(SessionReadError::UnsupportedOlderVersion { found, minimum }) => {
+                assert_eq!(found, SESSION_MIN_READABLE_VERSION - 1);
+                assert_eq!(minimum, SESSION_MIN_READABLE_VERSION);
+            }
+            other => panic!("expected UnsupportedOlderVersion, got {other:?}"),
         }
     }
 
@@ -405,5 +603,192 @@ mod tests {
             other => panic!("wrong event variant: {other:?}"),
         }
         assert!(reader.next().is_none());
+    }
+
+    #[test]
+    fn round_trip_handles_a_mixed_event_stream() {
+        // Cover every event category that the bus actually carries today:
+        // observation, scan, gateway, DNS, interface counters, lifecycle
+        // finding, sensor health. A canonical session must round-trip
+        // them all without losing fidelity.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.session");
+        let writer = SessionWriter::create(&path, SessionHeader::new(Some("mixed".into()))).unwrap();
+
+        let envelopes = vec![
+            Envelope::with_time(
+                EventId(1),
+                OffsetDateTime::from_unix_timestamp(1_700_000_001).unwrap(),
+                SensorId::new("wifi"),
+                Event::Scan(ScanResult {
+                    interface: "en0".into(),
+                    neighbors: vec![],
+                }),
+            ),
+            Envelope::with_time(
+                EventId(2),
+                OffsetDateTime::from_unix_timestamp(1_700_000_002).unwrap(),
+                SensorId::new("gateway"),
+                Event::GatewayLatency(GatewayLatencyObservation {
+                    target: "192.168.1.1".into(),
+                    rtt: Duration::from_micros(2500),
+                    reachable: true,
+                    probe: "icmp".into(),
+                }),
+            ),
+            Envelope::with_time(
+                EventId(3),
+                OffsetDateTime::from_unix_timestamp(1_700_000_003).unwrap(),
+                SensorId::new("dns"),
+                Event::DnsLatency(DnsLatencyObservation {
+                    resolver: "1.1.1.1".into(),
+                    query: "example.com".into(),
+                    rtt: Duration::from_millis(15),
+                    answered: false,
+                    error: Some("timeout".into()),
+                }),
+            ),
+            Envelope::with_time(
+                EventId(4),
+                OffsetDateTime::from_unix_timestamp(1_700_000_004).unwrap(),
+                SensorId::new("iface"),
+                Event::InterfaceCounters(InterfaceCountersObservation {
+                    interface: "en0".into(),
+                    rx_bytes_total: 1_000_000,
+                    tx_bytes_total: 200_000,
+                    rx_packets_total: 5000,
+                    tx_packets_total: 1000,
+                    rx_errors_total: 0,
+                    tx_errors_total: 0,
+                    rx_dropped_total: None,
+                    tx_dropped_total: None,
+                    retry_count: None,
+                }),
+            ),
+            Envelope::with_time(
+                EventId(5),
+                OffsetDateTime::from_unix_timestamp(1_700_000_005).unwrap(),
+                SensorId::new("analysis"),
+                Event::Finding(CorrelationFinding {
+                    kind: FindingKind::GatewayInstability,
+                    fingerprint: "gw_instability:192.168.1.1".into(),
+                    headline: "gateway flapping".into(),
+                    confidence: Confidence::new(0.7),
+                    peak_confidence: Confidence::new(0.7),
+                    evidence: vec!["loss 18%".into(), "p95 230 ms".into()],
+                    lifecycle: FindingLifecycle::Active,
+                    first_seen: OffsetDateTime::from_unix_timestamp(1_700_000_004).unwrap(),
+                    last_seen: OffsetDateTime::from_unix_timestamp(1_700_000_005).unwrap(),
+                }),
+            ),
+            Envelope::with_time(
+                EventId(6),
+                OffsetDateTime::from_unix_timestamp(1_700_000_006).unwrap(),
+                SensorId::new("wifi"),
+                Event::SensorHealth(SensorHealth {
+                    sensor: SensorId::new("wifi"),
+                    state: SensorState::Stale,
+                    backend: Some("system_profiler".into()),
+                    detail: Some("backend timed out".into()),
+                }),
+            ),
+        ];
+
+        for env in &envelopes {
+            writer.record(env).unwrap();
+        }
+        drop(writer);
+
+        let reader = SessionReader::open(&path).unwrap();
+        let read: Vec<Envelope> = reader.map(|r| r.unwrap()).collect();
+        assert_eq!(read.len(), envelopes.len());
+
+        for (a, b) in read.iter().zip(envelopes.iter()) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.at, b.at);
+            assert_eq!(a.source.as_str(), b.source.as_str());
+        }
+
+        // Spot-check that the more complex variants made it through.
+        match &read[4].event {
+            Event::Finding(f) => {
+                assert_eq!(f.kind, FindingKind::GatewayInstability);
+                assert_eq!(f.fingerprint, "gw_instability:192.168.1.1");
+                assert_eq!(f.lifecycle, FindingLifecycle::Active);
+                assert!((f.confidence.value() - 0.7).abs() < 1e-6);
+                assert_eq!(f.evidence.len(), 2);
+            }
+            other => panic!("expected Finding, got {other:?}"),
+        }
+        match &read[5].event {
+            Event::SensorHealth(h) => {
+                assert_eq!(h.state, SensorState::Stale);
+                assert_eq!(h.backend.as_deref(), Some("system_profiler"));
+                assert_eq!(h.detail.as_deref(), Some("backend timed out"));
+            }
+            other => panic!("expected SensorHealth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_line_surfaces_a_bad_json_error_with_line_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("malformed.session");
+
+        // Write a valid header + valid envelope + malformed line + valid envelope.
+        let writer = SessionWriter::create(&path, SessionHeader::new(None)).unwrap();
+        writer.record(&sample_envelope(1)).unwrap();
+        drop(writer);
+        // Append two rows by hand: one garbage, one valid. We do this
+        // outside the SessionWriter because the writer would refuse to
+        // emit non-row JSON.
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{{this is not valid json").unwrap();
+        let good = serde_json::to_string(&SessionRow::Envelope(sample_envelope(2))).unwrap();
+        writeln!(f, "{good}").unwrap();
+
+        let mut reader = SessionReader::open(&path).unwrap();
+        // First envelope reads cleanly.
+        let first = reader.next().unwrap().unwrap();
+        assert_eq!(first.id, EventId(1));
+        // Second row is malformed — must surface BadJson with the right line number.
+        match reader.next() {
+            Some(Err(SessionReadError::BadJson { line, .. })) => {
+                // Header is line 1; first envelope is line 2; malformed is line 3.
+                assert_eq!(line, 3, "wrong line number reported");
+            }
+            other => panic!("expected BadJson, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn header_tolerates_unknown_fields_for_forward_compat() {
+        // A future SignalScope might add metadata fields to the header.
+        // Today's reader MUST tolerate them — otherwise a v2 file written
+        // by a slightly newer version becomes unreadable for no good
+        // reason. (`format_version` only bumps on incompatible row-shape
+        // changes; additive header fields stay v2.)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future-fields.session");
+        let now = OffsetDateTime::now_utc();
+        // Use to_rfc3339 via the serde adapter format — build the
+        // header by hand-mixing in a future field.
+        let header = serde_json::json!({
+            "row": "header",
+            "kind": SESSION_KIND,
+            "format_version": SESSION_FORMAT_VERSION,
+            "created_at": now.format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "tool_version": "0.99.0",
+            "label": "future",
+            "hostname": "macmini.local",
+            "operator": "henry",
+        });
+        let env = serde_json::to_string(&SessionRow::Envelope(sample_envelope(1))).unwrap();
+        std::fs::write(&path, format!("{header}\n{env}\n")).unwrap();
+
+        let reader = SessionReader::open(&path).expect("forward-compat header should parse");
+        assert_eq!(reader.header().label.as_deref(), Some("future"));
+        let read: Vec<Envelope> = reader.map(|r| r.unwrap()).collect();
+        assert_eq!(read.len(), 1);
     }
 }

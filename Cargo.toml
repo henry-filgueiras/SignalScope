@@ -30,8 +30,10 @@ tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "time", "sy
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Time
-time = { version = "0.3", features = ["formatting", "macros", "serde"] }
+# Time. `serde-well-known` enables the `time::serde::rfc3339` adapter
+# we use to serialize session-file timestamps as inspectable ISO-8601
+# strings rather than the default tuple form.
+time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde", "serde-well-known"] }
 
 # Errors / logging
 thiserror = "1"
