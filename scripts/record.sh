@@ -1,46 +1,48 @@
 #!/usr/bin/env bash
-# Record a SignalScope session for a bounded duration.
+# Record a SignalScope session sized by the operator's intent.
 #
 # Usage:
-#   scripts/record.sh DURATION -o DIR [--label TEXT] [--warmup DURATION]
+#   scripts/record.sh DURATION -o DIR [--label TEXT] [--max DURATION]
 #
-# DURATION accepts a bare number (seconds) or a `<n><unit>` suffix where
-# unit is `s`, `m`, or `h` — e.g. `30s`, `5m`, `1h`.
+# DURATION is the *data* window: the script asks the binary to exit
+# only once every spawned sensor has produced observations that span
+# at least DURATION. So "30s" means "30 seconds of useful data from
+# every channel", not "30 wall-clock seconds." The recording's
+# wall-clock length is whatever it has to be to honor that.
+#
+# A sensor that reports degraded health (e.g. Wi-Fi off, no default
+# route) is treated as satisfied — capture won't hang waiting for a
+# source that physically can't contribute.
+#
+# DURATION accepts a bare number (seconds) or a `<n><unit>` suffix
+# where unit is `s`, `m`, or `h` — e.g. `30s`, `5m`, `1h`.
 #
 # DIR is the output directory. The session file is always written as
-# `DIR/session.signalscope-session`. The directory must already exist
-# OR be creatable; the script will mkdir -p.
+# `DIR/session.signalscope-session`. mkdir -p applies.
 #
-# --warmup adds a pre-roll period to the capture. The macOS Wi-Fi sensor
-# pays a one-shot ~10–15 s `system_profiler` cold-start cost; in a short
-# capture that means the first Wi-Fi data lands deep into the recording.
-# Set `--warmup 15s` (or similar) when you want the requested DURATION
-# to be observable-data time rather than wall-clock time.
-#
-# On completion, `signalscope inspect` runs against the file so the
-# operator gets an immediate summary.
+# --max is a wall-clock safety cap, passed through to the binary.
+# Defaults to max(60s, 3 × DURATION) so pathological waits don't
+# hang forever but reasonable captures aren't surprised by it.
 
 set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: record.sh DURATION -o DIR [--label TEXT] [--warmup DURATION]
+usage: record.sh DURATION -o DIR [--label TEXT] [--max DURATION]
 
-  DURATION    how long to record. Accepts 30s / 5m / 1h, or a bare
-              number of seconds.
+  DURATION    the data window per sensor. Accepts 30s / 5m / 1h, or
+              a bare number of seconds. Capture exits when every
+              spawned sensor has data spanning at least DURATION
+              (or has gone degraded, whichever).
   -o DIR      output directory. session.signalscope-session is
               written inside it.
   --label     optional free-form recording label.
-  --warmup    optional pre-roll added to the capture, in the same
-              format as DURATION. Defaults to 0. Useful on macOS
-              where Wi-Fi acquisition has a ~10–15 s cold start;
-              with `--warmup 15s` the requested duration becomes
-              steady-state observation time.
+  --max       wall-clock safety cap. Defaults to max(60s, 3*DURATION).
 
 Examples:
-  scripts/record.sh 20s -o "$(mktemp -d)"
+  scripts/record.sh 30s -o "$(mktemp -d)"
   scripts/record.sh 5m -o ./recordings/hotel-wifi
-  scripts/record.sh 30s --warmup 15s -o ./recordings/run-12
+  scripts/record.sh 30s --max 2m -o ./recordings/run-12
 EOF
 }
 
@@ -54,7 +56,7 @@ shift
 
 out_dir=""
 label=""
-warmup_raw="0"
+max_raw=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -68,9 +70,9 @@ while [[ $# -gt 0 ]]; do
       label="$2"
       shift 2
       ;;
-    --warmup)
-      [[ $# -ge 2 ]] || { echo "record.sh: --warmup requires a duration" >&2; exit 2; }
-      warmup_raw="$2"
+    --max)
+      [[ $# -ge 2 ]] || { echo "record.sh: --max requires a duration" >&2; exit 2; }
+      max_raw="$2"
       shift 2
       ;;
     -h|--help)
@@ -91,7 +93,6 @@ if [[ -z "$out_dir" ]]; then
   exit 2
 fi
 
-# Parse the duration suffix into seconds.
 parse_duration() {
   local raw="$1"
   case "$raw" in
@@ -102,25 +103,30 @@ parse_duration() {
   esac
 }
 
-if ! seconds="$(parse_duration "$duration_raw")"; then
+if ! window_seconds="$(parse_duration "$duration_raw")"; then
   echo "record.sh: could not parse duration '$duration_raw'" >&2
   exit 2
 fi
-if ! [[ "$seconds" =~ ^[0-9]+$ ]] || (( seconds < 1 )); then
+if ! [[ "$window_seconds" =~ ^[0-9]+$ ]] || (( window_seconds < 1 )); then
   echo "record.sh: duration must resolve to a positive integer of seconds (got '$duration_raw')" >&2
   exit 2
 fi
 
-if ! warmup_seconds="$(parse_duration "$warmup_raw")"; then
-  echo "record.sh: could not parse warmup '$warmup_raw'" >&2
-  exit 2
+# Wall-clock safety cap. Default keeps short captures unbothered
+# while still bounding long ones at 3× the requested window.
+if [[ -n "$max_raw" ]]; then
+  if ! max_seconds="$(parse_duration "$max_raw")"; then
+    echo "record.sh: could not parse --max '$max_raw'" >&2
+    exit 2
+  fi
+else
+  triple=$(( window_seconds * 3 ))
+  if (( triple > 60 )); then
+    max_seconds=$triple
+  else
+    max_seconds=60
+  fi
 fi
-if ! [[ "$warmup_seconds" =~ ^[0-9]+$ ]]; then
-  echo "record.sh: warmup must resolve to a non-negative integer of seconds (got '$warmup_raw')" >&2
-  exit 2
-fi
-
-total_seconds=$(( warmup_seconds + seconds ))
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -130,28 +136,22 @@ bin="$("$SCRIPT_DIR/_locate-binary.sh" "$REPO_ROOT")"
 mkdir -p "$out_dir"
 session_file="$out_dir/session.signalscope-session"
 
-# Default label includes the recording timestamp so untagged sessions
-# are still self-describing.
 if [[ -z "$label" ]]; then
   label="record-$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 fi
 
-if (( warmup_seconds > 0 )); then
-  echo "record.sh: capturing ${warmup_seconds}s warmup + ${seconds}s observation → ${session_file}"
-else
-  echo "record.sh: capturing for ${seconds}s → ${session_file}"
-fi
-"$bin" capture --output "$session_file" --label "$label" &
+echo "record.sh: capturing until every sensor spans ${window_seconds}s (hard cap ${max_seconds}s) → ${session_file}"
+"$bin" capture \
+  --output "$session_file" \
+  --label "$label" \
+  --window "${window_seconds}s" \
+  --max "${max_seconds}s" &
 ss_pid=$!
 
-# Forward SIGINT to the capture process so Ctrl-C cleanly closes the
-# session file rather than leaving the shell wrapper holding the bag.
 trap 'kill -INT "$ss_pid" 2>/dev/null || true' INT TERM
 
-# Sleep, then stop the capture cleanly. `wait` returns after the
-# capture process flushes and exits.
-sleep "$total_seconds"
-kill -INT "$ss_pid" 2>/dev/null || true
+# The binary exits on its own once the window is satisfied or --max
+# fires — no need for the script to manage timing. Just wait.
 wait "$ss_pid" || true
 
 echo

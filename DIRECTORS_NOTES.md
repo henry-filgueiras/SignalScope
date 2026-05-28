@@ -595,6 +595,90 @@ The TUI owns the terminal, so logs go to a rotating file under
 
 ## Resolved Dragons and Pivots
 
+### 2026-05-28 — Claude Opus 4.7 (capture sized by data window, not wall clock)
+
+**Pivot.** Operator-flagged that the previous `--warmup` flag in
+`record.sh` was an awkward escape hatch — it asked the operator
+to know SignalScope's internal sensor cold-start cost (~12 s for
+Wi-Fi on macOS). The correct unit of intent is **spans of usable
+data**, not wall-clock seconds. "Record 30 s" should mean "30 s
+of useful data from every sensor," and the recording's wall-clock
+length is whatever it has to be to honor that.
+
+**Mechanism.** `signalscope capture` grew two new flags:
+
+- `--window DURATION` — exit when every spawned sensor has data
+  spanning at least DURATION (or has gone degraded, whichever).
+  Tracks per-`SensorId` `first_at` / `last_at` on a bus
+  subscription; the set of expected sensors is whatever
+  `SensorScheduler::ids()` reports (so when sensor selection
+  becomes configurable later, this generalizes for free).
+  `SensorHealth` events update a `degraded` flag separate from
+  the data-span tracking — a sensor whose latest health state
+  isn't `Operational` is counted as satisfied so a turned-off
+  Wi-Fi adapter or missing default route doesn't hang the
+  capture forever. `analysis`-source events are ignored (we
+  only wait on the polling sources, not derived findings).
+- `--max DURATION` — hard wall-clock cap. Belt-and-suspenders
+  against a sensor that publishes neither observations nor
+  health events. When set, fires regardless of `--window`
+  state.
+
+Ctrl-C is always honored, whether either flag is set or not.
+
+**`record.sh` rework.** The positional `DURATION` now maps to
+`--window` (the natural reading of "record 30 s"). `--warmup`
+removed — the new design obsoletes it. `--max` is forwarded;
+default is `max(60 s, 3 × window)` so short captures aren't
+surprised by a tight cap and long captures have a reasonable
+ceiling. The script no longer sleeps and SIGINTs — it spawns
+the binary and waits for the binary's own exit.
+
+**Verification.**
+
+```text
+$ ./scripts/record.sh 30s -o $tmp
+record.sh: capturing until every sensor spans 30s (hard cap 90s) …
+
+source      first    last    span   count
+─────────────────────────────────────────
+dns         0.08s   45.01s  44.93s     16
+gateway     0.01s   45.07s  45.06s     46
+iface       0.01s   44.01s  44.00s     23
+wifi       11.92s   45.46s  33.54s      6
+
+wall-clock: 45s
+```
+
+Slowest sensor (Wi-Fi, paying the cold-start cost) dominated;
+every sensor reported a data span ≥ the requested 30 s; the
+recording's wall-clock length grew to the minimum needed to
+honor that.
+
+`--max` watchdog verified with `30s -o DIR --max 10s` for a
+60 s window: capture exited at 10 s wall-clock cleanly, no
+hanging.
+
+**Tests.** Six new tests in `capture::tests` pin the
+readiness-predicate contract:
+
+- empty-tracker / single-observation isn't satisfied;
+- per-sensor span check (every sensor must reach the window);
+- slowest-sensor-dominates;
+- degraded short-circuits to satisfied;
+- recovering from degraded re-requires the data window;
+- envelopes from unknown sources are ignored (no false
+  satisfaction from `analysis`-published findings).
+
+**Untouched.** Bus shape, event model, sensors, analysis,
+session format, observe/inspect/analyze paths, replay /
+landmarks / strip, primed-snapshot startup fix from the
+previous slice (which the new design naturally cooperates
+with — the 11.71 s Wi-Fi first observation is exactly when
+the per-sensor span starts ticking).
+
+`cargo test --workspace`: 103/103 green (was 97).
+
 ### 2026-05-28 — Claude Opus 4.7 (primed Wi-Fi snapshot: 14 s faster startup)
 
 **Bug.** Operator-reported: in a fresh recording, Wi-Fi data didn't

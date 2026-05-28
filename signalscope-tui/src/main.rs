@@ -223,6 +223,8 @@ fn parse_inspect<I: Iterator<Item = String>>(args: &mut I) -> Result<inspect::In
 fn parse_capture<I: Iterator<Item = String>>(args: &mut I) -> Result<capture::CaptureOptions, String> {
     let mut output: Option<PathBuf> = None;
     let mut label: Option<String> = None;
+    let mut window: Option<std::time::Duration> = None;
+    let mut max_duration: Option<std::time::Duration> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-o" | "--output" => {
@@ -233,14 +235,52 @@ fn parse_capture<I: Iterator<Item = String>>(args: &mut I) -> Result<capture::Ca
             "--label" => {
                 label = Some(args.next().ok_or("--label requires a value")?);
             }
+            "--window" => {
+                let raw = args.next().ok_or("--window requires a duration")?;
+                window = Some(parse_duration_arg(&raw, "--window")?);
+            }
+            "--max" => {
+                let raw = args.next().ok_or("--max requires a duration")?;
+                max_duration = Some(parse_duration_arg(&raw, "--max")?);
+            }
             "-h" | "--help" => {
-                return Err("usage: signalscope capture --output PATH [--label TEXT]".into())
+                return Err(
+                    "usage: signalscope capture --output PATH \
+                     [--label TEXT] [--window DURATION] [--max DURATION]"
+                        .into(),
+                )
             }
             other => return Err(format!("unknown capture option: {other}")),
         }
     }
     let output = output.ok_or_else(|| "capture requires --output PATH".to_string())?;
-    Ok(capture::CaptureOptions { output, label })
+    Ok(capture::CaptureOptions {
+        output,
+        label,
+        window,
+        max_duration,
+    })
+}
+
+/// Parse a duration argument like `30s`, `5m`, `1h`, or a bare number
+/// of seconds. Shared between `--window` and `--max`.
+fn parse_duration_arg(raw: &str, flag: &str) -> Result<std::time::Duration, String> {
+    let (n_str, unit_secs): (&str, u64) = if let Some(s) = raw.strip_suffix('s') {
+        (s, 1)
+    } else if let Some(s) = raw.strip_suffix('m') {
+        (s, 60)
+    } else if let Some(s) = raw.strip_suffix('h') {
+        (s, 3600)
+    } else {
+        (raw, 1)
+    };
+    let n: u64 = n_str
+        .parse()
+        .map_err(|_| format!("{flag}: could not parse duration {raw:?}"))?;
+    if n == 0 {
+        return Err(format!("{flag}: duration must be positive"));
+    }
+    Ok(std::time::Duration::from_secs(n * unit_secs))
 }
 
 fn print_usage() {
@@ -249,7 +289,8 @@ fn print_usage() {
          \n\
          USAGE:\n  \
              signalscope [observe] [--record PATH] [--label TEXT]\n  \
-             signalscope capture --output PATH [--label TEXT]\n  \
+             signalscope capture --output PATH [--label TEXT]\n                       \
+             [--window DURATION] [--max DURATION]\n  \
              signalscope analyze PATH\n  \
              signalscope inspect PATH\n  \
              signalscope help\n\
@@ -257,7 +298,11 @@ fn print_usage() {
          observe    Run the live TUI dashboard. Default subcommand.\n           \
                     --record  also writes every event to PATH as a JSONL session.\n  \
          capture    Headless recording — sensors run, events stream to PATH,\n           \
-                    periodic stderr status. No TUI. Ctrl-C to stop.\n  \
+                    periodic stderr status. No TUI.\n           \
+                    --window  exit when every spawned sensor has data spanning\n           \
+                              this much (e.g. 30s). Honors operator intent over\n           \
+                              wall-clock seconds.\n           \
+                    --max     hard wall-clock cap. Always Ctrl-C to stop early.\n  \
          analyze    Open a recorded session in the TUI. Snapshot at end of\n           \
                     recording; seek with [/] (1 event), {{/}} (10), Home/End.\n  \
          inspect    Print a one-screen summary of a recorded session — kind,\n           \
