@@ -89,6 +89,14 @@ The TUI owns the terminal, so logs go to a rotating file under
 
 ## Resolved Dragons and Pivots
 
+### 2026-05-28 — Claude Opus 4.7 (run script)
+
+Added `scripts/run.sh` — a thin wrapper around `cargo run -p
+signalscope-tui` that forwards any trailing CLI args to the binary and
+honors `SIGNALSCOPE_PROFILE` (`release` default, `debug` opt-in). Keeps
+the day-to-day invocation short and means the CI / docs only ever need
+to reference `scripts/run.sh`.
+
 ### 2026-05-28 — Claude Opus 4.7 (cargo check follow-up)
 
 **Bootstrap compiles clean.** A Rust toolchain became available
