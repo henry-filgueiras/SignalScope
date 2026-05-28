@@ -1,0 +1,13 @@
+[package]
+name = "signalscope-events"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Normalized, append-only event/observation model for SignalScope."
+
+[dependencies]
+serde = { workspace = true }
+time = { workspace = true }

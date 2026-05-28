@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime artifacts
+*.log
+/logs/
+/data/
+*.jsonl

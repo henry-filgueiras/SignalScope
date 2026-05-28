@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "signalscope-events",
+    "signalscope-core",
+    "signalscope-sensors",
+    "signalscope-analysis",
+    "signalscope-tui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/zerolimit/SignalScope"
+authors = ["SignalScope contributors"]
+
+[workspace.dependencies]
+# Internal crates
+signalscope-events = { path = "signalscope-events" }
+signalscope-core = { path = "signalscope-core" }
+signalscope-sensors = { path = "signalscope-sensors" }
+signalscope-analysis = { path = "signalscope-analysis" }
+
+# Runtime
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "time", "sync", "process", "net", "io-util", "signal"] }
+
+# Serialization (used by events; kept optional for downstream replay/JSONL)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Time
+time = { version = "0.3", features = ["formatting", "macros", "serde"] }
+
+# Errors / logging
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+
+# TUI
+ratatui = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Networking / DNS / probes
+hickory-resolver = "0.24"
+socket2 = { version = "0.5", features = ["all"] }
+
+# Utility
+parking_lot = "0.12"
+once_cell = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+opt-level = 0
+debug = true

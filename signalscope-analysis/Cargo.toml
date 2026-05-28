@@ -1,0 +1,16 @@
+[package]
+name = "signalscope-analysis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Platform-agnostic correlation engine for SignalScope."
+
+[dependencies]
+signalscope-events = { workspace = true }
+signalscope-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+time = { workspace = true }

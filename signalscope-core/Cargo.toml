@@ -1,0 +1,18 @@
+[package]
+name = "signalscope-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared runtime, event bus, and core types for SignalScope."
+
+[dependencies]
+signalscope-events = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+parking_lot = { workspace = true }
+time = { workspace = true }
+thiserror = { workspace = true }

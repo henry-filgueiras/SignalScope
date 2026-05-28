@@ -1,0 +1,28 @@
+[package]
+name = "signalscope-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Terminal dashboard for SignalScope."
+
+[[bin]]
+name = "signalscope"
+path = "src/main.rs"
+
+[dependencies]
+signalscope-events = { workspace = true }
+signalscope-core = { workspace = true }
+signalscope-sensors = { workspace = true }
+signalscope-analysis = { workspace = true }
+tokio = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+futures = "0.3"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+anyhow = { workspace = true }
+time = { workspace = true }
