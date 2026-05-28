@@ -595,6 +595,57 @@ The TUI owns the terminal, so logs go to a rotating file under
 
 ## Resolved Dragons and Pivots
 
+### 2026-05-28 — Claude Opus 4.7 (visual identity: logo + favicon)
+
+Added a project mark under `assets/` and a centered header in the
+README. Two files:
+
+- `assets/logo.svg` — 100×100 viewBox, 7 elements total (one
+  circle, one quadratic-bezier path, five line segments).
+- `assets/favicon.svg` — 32×32 viewBox, simplified for tiny
+  sizes (thicker proportional stroke, slightly different
+  spacing).
+
+Both use `stroke="currentColor"` with no fills or gradients —
+inherit the embedding context's text color, render in any
+monochrome scheme (light/dark GitHub, terminal splash, docs
+site, OS favicon, B&W print).
+
+**Symbolism.** Each element maps to something the project
+actually does:
+
+- The **ring** is the scope — the lens through which the
+  network is read.
+- The **wave** on the left is the live signal: continuous,
+  flowing, present.
+- The **vertical bar** at the center is the playhead — the
+  same `┃` glyph that marks the playhead column in the analyze
+  TUI's timeline strip.
+- The **discrete ticks** on the right are recorded
+  observations — what the live signal becomes once the
+  playhead has passed it. Same visual rhythm as landmark
+  glyphs on the timeline strip.
+
+The eye reads left-to-right as **signal → recorded history**.
+The composition is intentionally self-referential: the logo is
+a tiny version of the analyze-mode timeline strip, viewed from
+inside the scope's aperture.
+
+**Subtitle.** Header gained `*A flight recorder for flaky
+networks.*` as a centered italic line under the title. The
+existing `> Explain why the network environment feels bad.`
+mission quote is preserved one blank line below — the
+subtitle frames the *shape* of the tool (record + replay), the
+quote frames its *purpose*.
+
+**Why these constraints, briefly.** Low node count (7 / 6
+elements) keeps the SVGs trivially editable by hand and
+rendering predictably at 16×16. No gradients/shadows so the
+mark survives flat-color contexts (terminal splashes, ASCII
+art conversions, B&W documentation). `currentColor` so the
+same file works on a light README, a dark IDE, and an OS
+favicon strip without forking.
+
 ### 2026-05-28 — Claude Opus 4.7 (README sync)
 
 The README had drifted considerably from project reality — it

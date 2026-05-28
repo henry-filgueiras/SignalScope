@@ -1,4 +1,12 @@
-# SignalScope
+<p align="center">
+  <img src="assets/logo.svg" alt="SignalScope" width="120" height="120" />
+</p>
+
+<h1 align="center">SignalScope</h1>
+
+<p align="center"><em>A flight recorder for flaky networks.</em></p>
+
+<br />
 
 > Explain why the network environment feels bad.
 
