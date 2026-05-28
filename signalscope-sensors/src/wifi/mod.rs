@@ -79,14 +79,16 @@ impl Sensor for MacosWifiSensor {
 
 #[cfg(target_os = "macos")]
 async fn run_macos(id: SensorId, cfg: WifiSensorConfig, bus: Arc<EventBus>) {
-    use tokio::time::{interval, MissedTickBehavior};
+    use tokio::time::{interval, interval_at, Instant, MissedTickBehavior};
 
-    let backend = macos::detect_backend().await;
-    let backend_name = backend.as_ref().map(|b| b.name().to_string());
+    let detected = macos::detect_backend().await;
+    let backend_name = detected
+        .as_ref()
+        .map(|d| d.backend.name().to_string());
 
     let mut tracker = HealthTracker::new(id.clone(), backend_name.clone());
 
-    let Some(backend) = backend else {
+    let Some(detected) = detected else {
         // No usable backend at all. Emit health *once* and park; the rest
         // of the dashboard still functions against gateway / DNS.
         publish_health(
@@ -98,23 +100,50 @@ async fn run_macos(id: SensorId, cfg: WifiSensorConfig, bus: Arc<EventBus>) {
         std::future::pending::<()>().await;
         return;
     };
+    let macos::DetectedBackend { backend, primed_bytes } = detected;
 
     info!(sensor = %id, backend = %backend.name(), "wifi sensor running");
     publish_health(&bus, &mut tracker, SensorState::Operational, None);
 
-    let mut tick = interval(cfg.snapshot_interval);
+    // If `detect_backend` captured a usable snapshot during the probe,
+    // parse it now so the operator sees Wi-Fi state at startup instead
+    // of after a second cold `system_profiler` invocation. This is the
+    // difference between "~12 s to first observation" (current) and
+    // "~26 s to first observation" (pre-fix, when probe + first
+    // snapshot ran serially).
+    let had_primed = match (&backend, primed_bytes) {
+        (macos::WifiBackend::SystemProfiler, Some(bytes)) => {
+            match macos::system_profiler::parse(&bytes, &cfg.interface) {
+                Ok(snap) => {
+                    emit_snapshot(&id, &bus, snap);
+                    true
+                }
+                Err(e) => {
+                    warn!(sensor = %id, error = %e, "primed wifi snapshot parse failed");
+                    false
+                }
+            }
+        }
+        _ => false,
+    };
+
+    // When we already emitted a primed observation, push the first
+    // interval tick out by the full snapshot interval — otherwise the
+    // interval's default "fire immediately" behavior would run a fresh
+    // `system_profiler` right away and produce a second observation
+    // 0–3 s after the primed one.
+    let mut tick = if had_primed {
+        interval_at(Instant::now() + cfg.snapshot_interval, cfg.snapshot_interval)
+    } else {
+        interval(cfg.snapshot_interval)
+    };
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tick.tick().await;
         match backend.snapshot(&cfg.interface).await {
             Ok(snap) => {
-                if let Some(link) = snap.link {
-                    bus.publish(id.clone(), Event::Wifi(link));
-                }
-                if let Some(scan) = snap.scan {
-                    bus.publish(id.clone(), Event::Scan(scan));
-                }
+                emit_snapshot(&id, &bus, snap);
                 publish_health(&bus, &mut tracker, SensorState::Operational, None);
             }
             Err(macos::BackendError::HardwareDisabled) => {
@@ -184,6 +213,19 @@ impl Sensor for NoOpWifiSensor {
             );
             std::future::pending::<()>().await;
         })
+    }
+}
+
+/// Push a parsed snapshot onto the bus. Shared between the primed
+/// startup observation and the regular interval loop so both code
+/// paths agree on what "publishing a snapshot" means.
+#[cfg(target_os = "macos")]
+fn emit_snapshot(id: &SensorId, bus: &Arc<EventBus>, snap: macos::WifiSnapshot) {
+    if let Some(link) = snap.link {
+        bus.publish(id.clone(), Event::Wifi(link));
+    }
+    if let Some(scan) = snap.scan {
+        bus.publish(id.clone(), Event::Scan(scan));
     }
 }
 

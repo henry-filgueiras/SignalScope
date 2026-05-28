@@ -87,32 +87,64 @@ pub enum BackendError {
     Other(String),
 }
 
+/// Outcome of [`detect_backend`]. Carries the chosen backend plus, for
+/// `system_profiler`, the raw output we captured during the probe — so
+/// the sensor can emit its first observation without paying
+/// `system_profiler`'s cold-start cost a second time. On this host the
+/// cold start is ~12 s; before this optimization the sensor ran
+/// `system_profiler` twice serially at startup (probe + first snapshot)
+/// and operators saw a ~26 s gap before any Wi-Fi data appeared.
+#[derive(Debug)]
+pub struct DetectedBackend {
+    pub backend: WifiBackend,
+    /// Raw bytes from the probe invocation. `Some` for backends where the
+    /// probe naturally produces a usable snapshot (today: `system_profiler`'s
+    /// XML output). The sensor should hand these to the backend's parser
+    /// once before entering the normal interval cycle.
+    pub primed_bytes: Option<Vec<u8>>,
+}
+
 /// Choose the best backend available on this host. Heuristic: prefer
 /// `system_profiler` (works on every modern macOS); fall back to legacy
 /// `airport` only when present. Returns `None` if neither is usable, in
 /// which case the sensor should surface
 /// [`signalscope_events::SensorState::BackendUnavailable`].
-pub async fn detect_backend() -> Option<WifiBackend> {
-    if Path::new(SYSTEM_PROFILER_BIN).exists() && system_profiler_probe().await {
-        info!(backend = "system_profiler", "wifi backend selected");
-        return Some(WifiBackend::SystemProfiler);
+pub async fn detect_backend() -> Option<DetectedBackend> {
+    if Path::new(SYSTEM_PROFILER_BIN).exists() {
+        if let Some(bytes) = system_profiler_probe_with_output().await {
+            info!(backend = "system_profiler", "wifi backend selected");
+            return Some(DetectedBackend {
+                backend: WifiBackend::SystemProfiler,
+                primed_bytes: Some(bytes),
+            });
+        }
     }
     if Path::new(AIRPORT_BIN).exists() {
         info!(backend = "airport", "wifi backend selected (legacy)");
-        return Some(WifiBackend::Airport);
+        return Some(DetectedBackend {
+            backend: WifiBackend::Airport,
+            primed_bytes: None,
+        });
     }
     debug!("no wifi backend available");
     None
 }
 
-/// Cheap one-shot probe so we don't pick `system_profiler` on hosts where
-/// it returns no `SPAirPortDataType` (e.g. headless VMs without a Wi-Fi
-/// card). We only check the exit code; full parsing happens at snapshot
-/// time.
-async fn system_profiler_probe() -> bool {
+/// Probe `system_profiler` and capture its output. If the invocation
+/// succeeds with non-empty stdout we both (a) commit to this backend
+/// and (b) return the bytes so the sensor can use them as the primed
+/// first snapshot. We deliberately keep the probe and the first
+/// snapshot the same call — there's no point paying for two cold
+/// starts back-to-back when one invocation produces both signals.
+async fn system_profiler_probe_with_output() -> Option<Vec<u8>> {
     let out = Command::new(SYSTEM_PROFILER_BIN)
         .args(["-xml", "SPAirPortDataType"])
         .output()
-        .await;
-    matches!(out, Ok(o) if o.status.success() && !o.stdout.is_empty())
+        .await
+        .ok()?;
+    if out.status.success() && !out.stdout.is_empty() {
+        Some(out.stdout)
+    } else {
+        None
+    }
 }

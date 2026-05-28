@@ -595,6 +595,84 @@ The TUI owns the terminal, so logs go to a rotating file under
 
 ## Resolved Dragons and Pivots
 
+### 2026-05-28 — Claude Opus 4.7 (primed Wi-Fi snapshot: 14 s faster startup)
+
+**Bug.** Operator-reported: in a fresh recording, Wi-Fi data didn't
+appear until ~26 s into the trace. Every other sensor (iface,
+gateway, dns) was producing data within 40 ms. Half of a 60 s
+capture had no Wi-Fi at all.
+
+**Root cause.** On macOS, the Wi-Fi sensor was running
+`system_profiler -xml SPAirPortDataType` *twice* serially at
+startup:
+
+1. `detect_backend()` invoked it as a probe — verifying the binary
+   exists, the host has Wi-Fi at all, and `SPAirPortDataType`
+   returns non-empty output. **~12 s cold start.**
+2. The interval loop's immediate first tick then invoked it again
+   to fetch the actual snapshot. **~14 s** (also a cold start, since
+   the macOS profiler doesn't cache scan results between processes).
+
+So the probe was throwing away the very data the sensor was about
+to fetch on its next call. The fix is obvious in hindsight.
+
+**Fix.** `detect_backend()` now returns a `DetectedBackend { backend,
+primed_bytes: Option<Vec<u8>> }`. For the system_profiler path, the
+probe captures the output and hands it back; the sensor parses
+those bytes via the existing pure `system_profiler::parse(xml,
+interface)` function and emits the resulting observation
+immediately, before entering the interval loop.
+
+Two follow-on adjustments:
+
+- When a primed snapshot was emitted, the interval starts at
+  `Instant::now() + snapshot_interval` (via `interval_at`) instead
+  of its default fire-immediately behavior — otherwise we'd run
+  `system_profiler` again 0–3 s after the primed observation and
+  emit a redundant near-duplicate.
+- Pulled the emit-snapshot bus calls into a shared `emit_snapshot`
+  helper so the primed-startup path and the interval loop publish
+  with identical semantics.
+
+**Repro / verification.** Before: operator's recording showed
+`wifi/Wifi @ +26.34s`. After (same hardware, fresh recording):
+
+```text
+iface / InterfaceCounters      0.01s
+iface / SensorHealth           0.01s
+gateway / GatewayLatency       0.01s
+dns / DnsLatency               0.01s
+wifi / SensorHealth           11.71s
+wifi / Wifi                   11.71s   ← was 26.34s
+wifi / Scan                   11.71s
+```
+
+The `SensorHealth → Operational` edge and the first `Wifi`/`Scan`
+observations now land at the same instant — both fall out of the
+single `detect_backend` invocation. Saved ~14.6 s. The remaining
+~12 s is `system_profiler`'s genuine first-call latency and is out
+of scope until we either move to a different acquisition path or
+the `airport` backend gets resurrected for the link-only fast path.
+
+**Companion ergonomic — `--warmup` in `record.sh`.** Even with the
+fix, macOS Wi-Fi sensors don't produce data instantaneously; if the
+operator wants `N` seconds of *fully populated* trace, they need
+~12 s of pre-roll. Added an optional `--warmup DURATION` flag (same
+duration grammar as the positional argument) that prepends a silent
+pre-roll to the capture. Default 0 — preserves the previous
+contract that `30s -o DIR` means a 30 s capture. With `--warmup
+15s`, the script reports `capturing 15s warmup + 30s observation`
+and sleeps for 45 s total. The session file itself is
+indistinguishable from a 45 s capture; only the operator's
+intention is annotated.
+
+**Untouched.** Bus shape, event model, analysis crate, replay /
+landmarks / strip, session format, observe / capture / inspect /
+analyze paths, parser logic (the `system_profiler::parse` function
+is reused verbatim — the fix only changes what feeds it).
+
+`cargo test --workspace`: 97/97 green.
+
 ### 2026-05-28 — Claude Opus 4.7 (visual identity: logo + favicon)
 
 Added a project mark under `assets/` and a centered header in the
