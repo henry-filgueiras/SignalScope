@@ -27,6 +27,7 @@ use signalscope_events::{
 use tokio::time::interval;
 use tracing::warn;
 
+use crate::replay::Playback;
 use crate::ui;
 
 const GATEWAY_HISTORY: usize = 240;
@@ -41,6 +42,65 @@ const THROUGHPUT_WINDOW: Duration = Duration::from_secs(15);
 /// sparklines. At the iface sensor's 2 s cadence this is ~10 min of
 /// rolling history — enough to see a transfer crest and recover.
 const THROUGHPUT_HISTORY: usize = 300;
+
+pub async fn run_replay(playback: Playback) -> Result<()> {
+    let mut state = AppState::new();
+    state.playback = Some(playback);
+    state.rebuild_to_playhead();
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let result = replay_loop(&mut terminal, &mut state).await;
+
+    disable_raw_mode().ok();
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )
+    .ok();
+    terminal.show_cursor().ok();
+    result
+}
+
+async fn replay_loop<B>(terminal: &mut Terminal<B>, state: &mut AppState) -> Result<()>
+where
+    B: ratatui::backend::Backend,
+{
+    let mut term_events = EventStream::new();
+    let mut dirty = true;
+    loop {
+        if dirty {
+            terminal.draw(|f| ui::render(f, state))?;
+            dirty = false;
+        }
+        tokio::select! {
+            biased;
+            maybe_input = term_events.next() => {
+                match maybe_input {
+                    Some(Ok(ev)) => {
+                        match handle_replay_input(ev, state) {
+                            InputOutcome::Quit => break,
+                            InputOutcome::Continue => {}
+                        }
+                        // Always redraw — sparkline frames can shift even
+                        // when the seek itself moved zero events (focus,
+                        // detail toggle, help overlay).
+                        dirty = true;
+                    }
+                    Some(Err(e)) => warn!(error = %e, "terminal input error"),
+                    None => break,
+                }
+            }
+            _ = tokio::signal::ctrl_c() => break,
+        }
+    }
+    Ok(())
+}
 
 pub async fn run(bus: Arc<EventBus>) -> Result<()> {
     let mut state = AppState::new();
@@ -163,6 +223,72 @@ fn handle_input(ev: CtEvent, state: &mut AppState) -> InputOutcome {
     InputOutcome::Continue
 }
 
+/// Input handler used only in replay mode. Adds seek bindings on top
+/// of the shared common keys.
+fn handle_replay_input(ev: CtEvent, state: &mut AppState) -> InputOutcome {
+    if let CtEvent::Key(k) = ev {
+        if k.kind != KeyEventKind::Press {
+            return InputOutcome::Continue;
+        }
+        // Common keys first.
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('q') | KeyCode::Esc, _) => return InputOutcome::Quit,
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => return InputOutcome::Quit,
+            (KeyCode::Char('?'), _) | (KeyCode::Char('h'), KeyModifiers::NONE) => {
+                state.show_help = !state.show_help;
+                return InputOutcome::Continue;
+            }
+            (KeyCode::Char('d'), _) => {
+                state.show_neighbor_detail = !state.show_neighbor_detail;
+                return InputOutcome::Continue;
+            }
+            (KeyCode::Char('f'), _) | (KeyCode::Tab, _) => {
+                state.focus = state.focus.next();
+                return InputOutcome::Continue;
+            }
+            _ => {}
+        }
+        // Seek bindings. Shift-modified brackets ({, }) jump 10 events.
+        // Single brackets step one event. Home/End to either end.
+        let moved = match (k.code, k.modifiers) {
+            (KeyCode::Char('['), _) => seek(state, -1),
+            (KeyCode::Char(']'), _) => seek(state, 1),
+            (KeyCode::Char('{'), _) => seek(state, -10),
+            (KeyCode::Char('}'), _) => seek(state, 10),
+            (KeyCode::Left, KeyModifiers::SHIFT) => seek(state, -10),
+            (KeyCode::Right, KeyModifiers::SHIFT) => seek(state, 10),
+            (KeyCode::Left, _) => seek(state, -1),
+            (KeyCode::Right, _) => seek(state, 1),
+            (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => seek_to_start(state),
+            (KeyCode::End, _) | (KeyCode::Char('G'), _) => seek_to_end(state),
+            _ => false,
+        };
+        if moved {
+            state.rebuild_to_playhead();
+        }
+    }
+    InputOutcome::Continue
+}
+
+fn seek(state: &mut AppState, delta: isize) -> bool {
+    match state.playback.as_mut() {
+        Some(p) => p.seek_by(delta),
+        None => false,
+    }
+}
+fn seek_to_start(state: &mut AppState) -> bool {
+    match state.playback.as_mut() {
+        Some(p) => p.seek_to_start(),
+        None => false,
+    }
+}
+fn seek_to_end(state: &mut AppState) -> bool {
+    match state.playback.as_mut() {
+        Some(p) => p.seek_to_end(),
+        None => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Overview,
@@ -226,6 +352,12 @@ pub struct AppState {
     /// instead of the occupancy histogram. Default is the histogram —
     /// individual identities are demoted to opt-in detail.
     pub show_neighbor_detail: bool,
+    /// `Some` in `signalscope analyze` mode. When set, `virtual_now()`
+    /// returns the playhead's wall-clock `at` instead of real time, so
+    /// every temporal callout on the dashboard ("Held 12m", "stable
+    /// 2m12s", "Δ RSSI / 60s") reads as it would have at the moment
+    /// of recording.
+    pub playback: Option<Playback>,
 }
 
 impl AppState {
@@ -249,6 +381,51 @@ impl AppState {
             focus: Focus::Overview,
             show_help: false,
             show_neighbor_detail: false,
+            playback: None,
+        }
+    }
+
+    /// Wall-clock "now" for temporal callouts. In live mode this is
+    /// real time; in replay mode it's the playhead's event timestamp.
+    /// All AppState helpers that ask "how long since X" go through here.
+    pub fn virtual_now(&self) -> time::OffsetDateTime {
+        match &self.playback {
+            Some(p) => p.virtual_now(),
+            None => time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    /// Clear every accumulator that `ingest()` writes to. Used before
+    /// re-ingesting the events from start-of-recording up to a new
+    /// playhead position.
+    pub fn reset_for_replay(&mut self) {
+        self.latest_wifi = None;
+        self.latest_scan = None;
+        self.gateway_history.clear();
+        self.dns_history.clear();
+        self.findings.clear();
+        self.sensor_health.clear();
+        self.event_feed.clear();
+        self.connected_identity = (None, None);
+        self.connected_since = None;
+        self.signal_history.clear();
+        self.latest_counters = None;
+        self.throughput.forget();
+        self.rx_throughput_history.clear();
+        self.tx_throughput_history.clear();
+    }
+
+    /// Rebuild dashboard state from the recorded envelope stream up
+    /// to and including the current playhead. Idempotent; safe to call
+    /// on every seek.
+    pub fn rebuild_to_playhead(&mut self) {
+        let envelopes = match &self.playback {
+            Some(p) => p.envelopes_through_playhead().to_vec(),
+            None => return,
+        };
+        self.reset_for_replay();
+        for env in envelopes {
+            self.ingest(&env);
         }
     }
 
@@ -338,7 +515,7 @@ impl AppState {
     /// observed. `None` when not associated.
     pub fn connected_duration(&self) -> Option<Duration> {
         let since = self.connected_since?;
-        let now = time::OffsetDateTime::now_utc();
+        let now = self.virtual_now();
         let secs = (now - since).whole_seconds().max(0);
         Some(Duration::from_secs(secs as u64))
     }
@@ -347,7 +524,7 @@ impl AppState {
     /// `lookback`. Returns `None` if either half has fewer than 2
     /// samples — we don't want to claim a trend from a single reading.
     pub fn rssi_delta_over(&self, lookback: Duration) -> Option<f64> {
-        let now = time::OffsetDateTime::now_utc();
+        let now = self.virtual_now();
         let half = lookback.as_secs() as i64 / 2;
         let recent_start = now - time::Duration::seconds(half);
         let prior_start = now - time::Duration::seconds(lookback.as_secs() as i64);

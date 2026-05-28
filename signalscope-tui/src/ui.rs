@@ -38,23 +38,56 @@ pub fn render(f: &mut Frame, state: &AppState) {
     render_footer(f, outer[3], state);
 
     if state.show_help {
-        render_help_overlay(f, area);
+        render_help_overlay(f, area, state.playback.is_some());
     }
 }
 
 fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
-    let sensors = "wifi · gateway · dns · iface";
-    let uptime = crate::app::fmt_uptime(state.uptime());
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled("SignalScope", theme::title_style()),
         Span::styled("  ·  ", theme::dim()),
-        Span::styled("live", Style::default().fg(theme::INFO_FG)),
-        Span::styled("  ·  uptime ", theme::dim()),
-        Span::styled(uptime, theme::value()),
-        Span::styled("  ·  sensors: ", theme::dim()),
-        Span::styled(sensors, theme::value()),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+    ];
+
+    if let Some(p) = &state.playback {
+        // Replay mode: the header is the timeline. Show the source
+        // label, the playhead position relative to the recording,
+        // and the absolute event timestamp.
+        spans.push(Span::styled("analyze", Style::default().fg(theme::WARN_FG)));
+        if let Some(label) = p.header.label.as_deref() {
+            spans.push(Span::styled("  ·  ", theme::dim()));
+            spans.push(Span::styled(label.to_string(), theme::value()));
+        }
+        let elapsed = humanize_duration(p.elapsed());
+        let total = humanize_duration(p.total_span());
+        spans.push(Span::styled("  ·  playhead ", theme::dim()));
+        spans.push(Span::styled(
+            format!("+{elapsed} of {total}"),
+            theme::value(),
+        ));
+        spans.push(Span::styled("  ·  ", theme::dim()));
+        spans.push(Span::styled(
+            format!("{}/{}", p.playhead + 1, p.len()),
+            Style::default().fg(theme::INFO_FG),
+        ));
+        spans.push(Span::styled("  ·  ", theme::dim()));
+        let now_str = p
+            .virtual_now()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "—".into());
+        spans.push(Span::styled(now_str, theme::dim()));
+    } else {
+        let uptime = crate::app::fmt_uptime(state.uptime());
+        spans.push(Span::styled("live", Style::default().fg(theme::INFO_FG)));
+        spans.push(Span::styled("  ·  uptime ", theme::dim()));
+        spans.push(Span::styled(uptime, theme::value()));
+        spans.push(Span::styled("  ·  sensors: ", theme::dim()));
+        spans.push(Span::styled(
+            "wifi · gateway · dns · iface",
+            theme::value(),
+        ));
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
@@ -68,21 +101,32 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
     } else {
         "occupancy"
     };
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled("q ", theme::value()),
         Span::styled("quit ", theme::dim()),
         Span::styled(" · tab ", theme::value()),
         Span::styled("focus ", theme::dim()),
         Span::styled(" · d ", theme::value()),
         Span::styled("RF view ", theme::dim()),
-        Span::styled(" · ? ", theme::value()),
-        Span::styled("help ", theme::dim()),
-        Span::styled("    focus: ", theme::dim()),
-        Span::styled(focus_label, Style::default().fg(theme::INFO_FG)),
-        Span::styled("   RF: ", theme::dim()),
-        Span::styled(detail_label, Style::default().fg(theme::INFO_FG)),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+    ];
+    if state.playback.is_some() {
+        spans.push(Span::styled(" · [/] ", theme::value()));
+        spans.push(Span::styled("seek ", theme::dim()));
+        spans.push(Span::styled("· {/} ", theme::value()));
+        spans.push(Span::styled("×10 ", theme::dim()));
+        spans.push(Span::styled("· g/G ", theme::value()));
+        spans.push(Span::styled("ends ", theme::dim()));
+    }
+    spans.push(Span::styled(" · ? ", theme::value()));
+    spans.push(Span::styled("help ", theme::dim()));
+    spans.push(Span::styled("    focus: ", theme::dim()));
+    spans.push(Span::styled(focus_label, Style::default().fg(theme::INFO_FG)));
+    spans.push(Span::styled("   RF: ", theme::dim()));
+    spans.push(Span::styled(
+        detail_label,
+        Style::default().fg(theme::INFO_FG),
+    ));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_main(f: &mut Frame, area: Rect, state: &AppState) {
@@ -1282,9 +1326,10 @@ fn render_feed(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(List::new(items), inner);
 }
 
-fn render_help_overlay(f: &mut Frame, area: Rect) {
-    let w = 50.min(area.width.saturating_sub(4));
-    let h = 11.min(area.height.saturating_sub(4));
+fn render_help_overlay(f: &mut Frame, area: Rect, replay_mode: bool) {
+    let h = if replay_mode { 17 } else { 11 };
+    let w = 56.min(area.width.saturating_sub(4));
+    let h = (h as u16).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
@@ -1297,22 +1342,36 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
     f.render_widget(ratatui::widgets::Clear, rect);
     f.render_widget(block, rect);
 
-    let body = vec![
+    let mut body = vec![
         Line::from("q / Esc        quit"),
         Line::from("Ctrl-C         quit"),
         Line::from("tab / f        cycle focus"),
         Line::from("d              toggle RF view (occupancy ↔ AP table)"),
-        Line::from("?  / h         toggle this help"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "SignalScope is read-only — no packet capture, no probes",
-            theme::dim(),
-        )),
-        Line::from(Span::styled(
-            "beyond ping + DNS resolution.",
-            theme::dim(),
-        )),
+        Line::from("?              toggle this help"),
     ];
+    if replay_mode {
+        body.push(Line::from(""));
+        body.push(Line::from(Span::styled(
+            "Timeline (analyze mode)",
+            Style::default()
+                .fg(theme::WARN_FG)
+                .add_modifier(Modifier::BOLD),
+        )));
+        body.push(Line::from("[  /  ]        seek back/forward 1 event"));
+        body.push(Line::from("{  /  }        seek back/forward 10 events"));
+        body.push(Line::from("← / →          seek 1 event (Shift = 10)"));
+        body.push(Line::from("g / G          jump to start / end"));
+        body.push(Line::from("Home / End     jump to start / end"));
+    }
+    body.push(Line::from(""));
+    body.push(Line::from(Span::styled(
+        "SignalScope is read-only — no packet capture, no probes",
+        theme::dim(),
+    )));
+    body.push(Line::from(Span::styled(
+        "beyond ping + DNS resolution.",
+        theme::dim(),
+    )));
     f.render_widget(Paragraph::new(body), inner);
 }
 

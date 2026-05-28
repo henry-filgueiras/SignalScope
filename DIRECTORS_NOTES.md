@@ -223,6 +223,70 @@ roam / findings / sensor_health). No TUI, no replay, no analysis —
 just the smallest tool that confirms a `.signalscope-session` file
 is what the recipient thinks it is.
 
+### `signalscope analyze` — offline replay
+
+`signalscope analyze PATH` opens a recorded session inside the same
+TUI the live dashboard uses. There are no separate "replay views";
+the dashboard renders exactly as if the recording had stopped at
+the *playhead's* event. That's the simplifying choice the whole
+replay design hangs on:
+
+- **Virtual now.** `AppState::virtual_now()` returns the playhead
+  event's wall-clock `at` instead of real time when replay is
+  active. Every temporal callout — "Held 12m34s", "stable 2m12s",
+  "Δ RSSI / 60s", "bursting 6s" — reads as it would have at that
+  moment. No alternative renderers, no special-casing in stance
+  classifiers.
+- **Event-anchored playhead.** The playhead is always an index
+  into the recording's envelope vec. `[`/`]` step ±1 event, `{`/`}`
+  step ±10, `g`/`G` (and `Home`/`End`) jump to the endpoints. Two
+  events spaced 10 hours apart still navigate cleanly — every key
+  press lands on a real event. Time-based scrubbing would have to
+  snap-to-nearest-event anyway; we collapse the two operations.
+- **Full rebuild on every seek.** Moving the playhead clears every
+  event-derived field in `AppState` (histories, findings,
+  throughput windows, sensor health, event feed, connected
+  identity) and re-ingests envelopes `0..=playhead`. Microseconds
+  even for sessions of any plausible size; the operator's reaction
+  time is the bottleneck, not the CPU. The reward for skipping the
+  cache is that the seeked state is *bit-identical* to "if the
+  recording had stopped here." No drift, no stale half-state.
+- **Header is the timeline.** In replay mode the top line reads
+  `SignalScope · analyze · {label} · playhead +Xs of Ys · N/M ·
+  <RFC 3339 timestamp>` instead of the live `uptime` line. The
+  footer surfaces the seek bindings; the help overlay grows a
+  "Timeline" section.
+
+`replay::Playback` (in `signalscope-tui/src/replay.rs`) owns the
+loaded envelope vec + the playhead index. The bus is not involved
+in replay — analysis runs aren't re-spun; the analysis crate's
+`Finding` events are read back from the recording verbatim. That
+means findings reflect what the *original* analysis engine
+emitted, not what a re-run would emit. Today the two are the
+same; if the analysis crate ever evolves, recorded findings are
+"what was thought at recording time" and that's a deliberate
+feature — re-analysis is a separate future tool.
+
+### Record + analyze workflow scripts
+
+Two shell wrappers in `scripts/` give the canonical record →
+analyze loop a single-command shape:
+
+- `scripts/record.sh DURATION -o DIR [--label TEXT]` — wraps
+  `signalscope capture` with a SIGINT-after-sleep timeout. Parses
+  `30s` / `5m` / `1h` durations, mkdirs the output directory,
+  writes the session as `DIR/session.signalscope-session`, and
+  prints the `inspect` summary on completion. Default label is
+  `record-{ISO8601}` so untagged sessions still self-describe.
+- `scripts/analyze.sh DIR_OR_FILE` — accepts either a directory
+  written by `record.sh` (looks for `session.signalscope-session`
+  inside) or a direct path. Execs `signalscope analyze`.
+- `scripts/_locate-binary.sh` — shared helper, picks the most
+  recently-built binary between `target/release/signalscope` and
+  `target/debug/signalscope` (avoids a stale release shadowing a
+  fresh debug during iteration). Honors `SIGNALSCOPE_BIN` as an
+  override. Builds debug if neither exists.
+
 ### Event source abstraction
 
 `core::source::EventSource` is a tiny pull trait — `async fn
@@ -392,6 +456,114 @@ The TUI owns the terminal, so logs go to a rotating file under
 ---
 
 ## Resolved Dragons and Pivots
+
+### 2026-05-28 — Claude Opus 4.7 (offline replay: analyze subcommand + record/analyze scripts)
+
+**Goal.** Close the record → hand-off → review loop. After v2
+canonicalized the session format, the natural next move was to
+make a recorded session actually *openable* in the dashboard,
+without re-running the network. `signalscope analyze PATH` does
+that; `scripts/record.sh` + `scripts/analyze.sh` give it a
+single-command UX.
+
+**Key design question — how to navigate?** Three options surfaced:
+
+A. Snapshot at end-of-recording only, no seek.
+B. Snapshot + event-stepped seek keys.
+C. Real-time playback at original cadence.
+
+Went with **B**. The user's framing — "snap to closest event ≤
+now, so we don't get swaths of no-ops" — collapses naturally to
+event-anchored playhead: `[ ]` ±1 event, `{ }` ±10, `g G` /
+`Home End` to ends. Two events 10 hours apart still navigate in
+two key presses. Time-based scrubbing would require snap-to-
+event anyway; we drop the redundant axis.
+
+**Virtual now is the trick.** All temporal callouts on the
+dashboard ("Held 12m34s", "stable 2m12s", "bursting 6s", "Δ RSSI
+/ 60s") are anchored on a `now` that's `OffsetDateTime::now_utc`
+in live mode. For a recording from yesterday that breaks every
+phrase. The fix: `AppState::virtual_now()` returns the playhead's
+event `at` instead, when replay is active. No stance-classifier
+changes, no parallel renderers — the existing helpers just route
+their `now` reads through the one indirection.
+
+**Full rebuild on every seek.** Moving the playhead clears every
+event-derived field in `AppState` (gateway/dns/rssi/throughput
+histories, findings map, sensor health, event feed, connected
+identity + duration, throughput windows) and re-ingests
+`events[0..=playhead]`. Microseconds even for the largest
+plausible session. The reward for skipping the cache is bit-
+identical state to "if recording had stopped here." No drift,
+no stale half-state, no special-case rendering paths.
+
+**Replay module.** New `signalscope-tui/src/replay.rs`:
+`Playback { header, events: Arc<[Arc<Envelope>]>, playhead }`
+with `seek_by(±n)`, `seek_to_start/end`, `virtual_now`,
+`elapsed`, `total_span`, `envelopes_through_playhead`. Eight
+unit tests pin the navigation contract (load-with-playhead-at-
+end, reject-empty-session, clamp at boundaries, single-step,
+endpoints, growing prefix slice, virtual-now tracking,
+elapsed/total span consistency).
+
+**App integration.** `AppState` grew an `Option<Playback>` and
+`reset_for_replay()` / `rebuild_to_playhead()` helpers.
+`virtual_now()` was added and the two existing
+`OffsetDateTime::now_utc()` reads in `connected_duration` and
+`rssi_delta_over` were routed through it. `app::run_replay`
+sets up the TUI without a bus, calls
+`rebuild_to_playhead`, and runs `replay_loop` (no live bus
+subscription; ctrl-C and ESC quit).
+
+**Input handling.** A separate `handle_replay_input` lives next
+to `handle_input` rather than overloading the live handler.
+Shared keys (`q`, `?`, `d`, `tab`, `f`) behave identically;
+the replay handler additionally maps `[ ] { } ← →` (Shift =
+×10) and `g G Home End`. Live handler is unchanged so observe-
+mode behavior is exactly what it was.
+
+**UI changes.** The header reads `analyze · {label} · playhead
++8s of 20s · 12/23 · 2026-05-28T19:23:21.456Z` in replay mode
+instead of `live · uptime …`. The footer adds the seek key
+hints. The help overlay gains a "Timeline (analyze mode)"
+section listing the bindings. Live header/footer/help are
+unchanged.
+
+**CLI surface.**
+`signalscope analyze PATH` joins observe / capture / inspect /
+help. Help text updated. The `signalscope inspect` doc also got
+updated to call out RFC 3339 inspectability.
+
+**Scripts.** `scripts/record.sh DURATION -o DIR [--label TEXT]`
+parses `30s` / `5m` / `1h` (and bare seconds), wraps
+`signalscope capture` with a SIGINT-after-sleep timeout, calls
+`signalscope inspect` on completion so the operator gets
+immediate feedback. `scripts/analyze.sh DIR_OR_FILE` accepts
+either form. Both shell out to `scripts/_locate-binary.sh`
+which picks the more-recently-built of release/debug (caught
+during smoke testing: a stale `target/release/signalscope` from
+before the inspect+analyze subcommands was being preferred over
+a fresh debug build). Honors `SIGNALSCOPE_BIN` as a pin.
+
+**Error paths verified non-interactively:** `signalscope analyze
+/nonexistent` → "No such file or directory"; empty file →
+"session file is empty"; wrong-kind file → `WrongKind`. All
+exit cleanly, no panics.
+
+**Smoke end-to-end.** `mktemp -d` → `scripts/record.sh 6s -o
+$tmpdir --label smoke` → 12 envelopes captured, inspect output
+shows them per category. `scripts/analyze.sh $tmpdir` then
+locates the file and execs the analyze TUI. Manual seek
+verification deferred to the user since the TUI needs an
+interactive terminal.
+
+**Untouched.** Bus shape, event model, sensors, analysis crate
+(rolling windows + lifecycle pipeline unchanged), TemporalSeries,
+gateway/dns/throughput stance classifiers, RF occupancy panel,
+session-recording format. The change is purely additive in the
+TUI crate plus two shell wrappers.
+
+`cargo test --workspace`: 71/71 green (up from 63).
 
 ### 2026-05-28 — Claude Opus 4.7 (canonical recording format v2, inspect)
 

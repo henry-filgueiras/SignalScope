@@ -20,6 +20,7 @@ use tracing::info;
 mod app;
 mod capture;
 mod inspect;
+mod replay;
 mod theme;
 mod ui;
 
@@ -55,7 +56,27 @@ async fn main() -> Result<()> {
             signalscope_core::logging::init_stderr();
             inspect::run(opts).await
         }
+        Command::Analyze(opts) => {
+            init_logging_file();
+            info!("signalscope analyze starting");
+            run_analyze(opts).await
+        }
     }
+}
+
+async fn run_analyze(opts: AnalyzeOptions) -> Result<()> {
+    let playback = replay::Playback::load(&opts.path)?;
+    info!(
+        path = %opts.path.display(),
+        events = playback.len(),
+        span_seconds = playback.total_span().as_secs(),
+        "session loaded for replay"
+    );
+    app::run_replay(playback).await
+}
+
+struct AnalyzeOptions {
+    path: PathBuf,
 }
 
 async fn run_observe(opts: ObserveOptions) -> Result<()> {
@@ -105,6 +126,7 @@ enum Command {
     Observe(ObserveOptions),
     Capture(capture::CaptureOptions),
     Inspect(inspect::InspectOptions),
+    Analyze(AnalyzeOptions),
 }
 
 #[derive(Default)]
@@ -122,6 +144,7 @@ fn parse_args() -> Result<Command, String> {
         Some("observe") => Ok(Command::Observe(parse_observe(&mut args)?)),
         Some("capture") => Ok(Command::Capture(parse_capture(&mut args)?)),
         Some("inspect") => Ok(Command::Inspect(parse_inspect(&mut args)?)),
+        Some("analyze") => Ok(Command::Analyze(parse_analyze(&mut args)?)),
         // Backward compat: bare flags after the program name behave like
         // `observe <flags>` so existing invocations keep working.
         Some(s) if s.starts_with('-') => {
@@ -153,6 +176,26 @@ fn parse_observe<I: Iterator<Item = String>>(args: &mut I) -> Result<ObserveOpti
         return Err("--label requires --record".into());
     }
     Ok(opts)
+}
+
+fn parse_analyze<I: Iterator<Item = String>>(args: &mut I) -> Result<AnalyzeOptions, String> {
+    let mut path: Option<PathBuf> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => return Err("usage: signalscope analyze PATH".into()),
+            other if other.starts_with('-') => {
+                return Err(format!("unknown analyze option: {other}"))
+            }
+            other => {
+                if path.is_some() {
+                    return Err(format!("unexpected extra argument: {other}"));
+                }
+                path = Some(PathBuf::from(other));
+            }
+        }
+    }
+    let path = path.ok_or_else(|| "analyze requires a PATH argument".to_string())?;
+    Ok(AnalyzeOptions { path })
 }
 
 fn parse_inspect<I: Iterator<Item = String>>(args: &mut I) -> Result<inspect::InspectOptions, String> {
@@ -205,6 +248,7 @@ fn print_usage() {
          USAGE:\n  \
              signalscope [observe] [--record PATH] [--label TEXT]\n  \
              signalscope capture --output PATH [--label TEXT]\n  \
+             signalscope analyze PATH\n  \
              signalscope inspect PATH\n  \
              signalscope help\n\
          \n\
@@ -212,6 +256,8 @@ fn print_usage() {
                     --record  also writes every event to PATH as a JSONL session.\n  \
          capture    Headless recording — sensors run, events stream to PATH,\n           \
                     periodic stderr status. No TUI. Ctrl-C to stop.\n  \
+         analyze    Open a recorded session in the TUI. Snapshot at end of\n           \
+                    recording; seek with [/] (1 event), {{/}} (10), Home/End.\n  \
          inspect    Print a one-screen summary of a recorded session — kind,\n           \
                     format version, span, per-category event tally. Verifies\n           \
                     a handed-off `.signalscope-session` file end-to-end.\n\
