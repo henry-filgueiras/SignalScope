@@ -595,6 +595,135 @@ The TUI owns the terminal, so logs go to a rotating file under
 
 ## Resolved Dragons and Pivots
 
+### 2026-05-28 — Claude Opus 4.7 (signal quality: wakeup-aware findings + holdtime landmarks)
+
+**Bug class.** Replay investigation surfaced two coupled signal-
+quality issues:
+
+1. The `GatewayInstability` finding fired on a single elevated RTT
+   sample (`p95/median ≥ 4×`) whenever the window happened to
+   contain one big outlier. That pattern often corresponds to
+   Wi-Fi radio waking from power-save, not gateway instability.
+2. The landmarks pane was producing many landmarks per recording,
+   most of which were transient regime flicker (`idle ↔ trickle`,
+   single-sample gateway spikes) rather than investigation-worthy
+   moments.
+
+**Diagnosis.** Both issues had the same root: the existing logic
+treated each *flip* as a transition, with no notion of how long
+the new state had to hold to be real, and no notion of what the
+link was doing in the lead-up. The information needed to make
+better calls — throughput history, sample-counts above a
+threshold — already existed; it just wasn't being consulted.
+
+**Fix — analysis side.** `gateway_instability` grew two new
+inputs:
+
+- `GatewayWindow::samples_above_ms(threshold)`. Counts reachable
+  samples whose RTT exceeds a threshold. Lets the rule say
+  "elevated samples" instead of leaning entirely on `p95/median`.
+- `InterfaceThroughputWindow` (now threaded through `evaluate`).
+  Used by a new `link_is_idle` helper that reads the rolling
+  rate against the same 50 Kbps idle floor the dashboard's
+  stance phrase uses.
+
+Updated rule logic: the cheap-reject (`loss < 5% && jitter < 4×`)
+still runs first. Beyond that, an **isolated spike** (≤1 elevated
+sample) is silently suppressed when the link is idle and there's
+no loss — that's the wakeup-latency pattern. Sustained elevation
+(≥2 elevated samples), or loss, or any spike on an active link,
+still fires. The headline keeps the same shape; the **evidence
+gains an `Elevated samples (>2× median): N/M` line and a `Link
+recently {idle,active}` context line** so the operator can judge
+why the rule chose to speak up.
+
+**Fix — landmark side.** Two cooperating mechanisms now sit
+between sensor data and landmark emission:
+
+- **Hold-time discipline.** Throughput regime changes require
+  ≥10 s of held state to commit; gateway stance changes require
+  ≥3 consecutive samples. A `ThroughputHold` / `GwHold` tracker
+  carries `(committed, candidate)` state and only emits when the
+  candidate has held long enough *and* differs from what's
+  currently committed. The landmark anchors on the moment the
+  new state *started*, not the moment we became confident —
+  jumping to a landmark in replay still takes the operator to
+  the actual transition.
+- **Selective emission.** `is_notable_throughput_transition`
+  filters at emission time. Only `→ Bursting`, `Idle → Sustained`,
+  `Trickle → Sustained`, `Bursting → Idle`, and `Sustained → Idle`
+  emit. `idle ↔ trickle` background blips and `sustained → trickle`
+  slowdowns are silenced — they're texture, not action.
+
+The first-commit-at-session-start case is suppressed for Stable
+gateway and Idle/Trickle throughput (those aren't transitions —
+they're the recording starting normal). Sessions opening
+already-broken (Spiking / Unreachable / Sustained / Bursting)
+DO landmark — that's "we started in trouble" and the operator
+should see it.
+
+**Wakeup tagging.** The deriver also maintains a
+`last_active_at: Option<OffsetDateTime>` updated whenever the
+throughput classifier sees a non-Idle regime. When a gateway
+spike commits and `last_active_at` is older than
+`WAKEUP_IDLE_THRESHOLD_SECS` (15 s), the landmark gets:
+
+- `Notable` severity instead of `Alarm`, and
+- headline `Gateway latency rose · X ms · wakeup likely`
+  instead of `Gateway spiking · X ms`.
+
+The operator still sees the landmark — explainability preserved
+— but it doesn't read as a fire to investigate.
+
+**Tunables.**
+
+```text
+GW_ELEVATED_MULT             2.0×    sample > 2× median = elevated
+GW_ISOLATED_MAX              1       ≤1 elevated = isolated
+LINK_IDLE_BPS                50 K    matches dashboard idle floor
+THROUGHPUT_HOLD_SECS         10      regime must hold this long
+GW_HOLD_CONSECUTIVE          3       stance must hold this many samples
+WAKEUP_IDLE_THRESHOLD_SECS   15      idle ≥ this = wakeup-likely
+```
+
+All in a single `const` block per side; tuning later is a small
+edit, not a rewrite.
+
+**Tests (+12 from 103).** Rule-side, six new tests pin:
+silent-on-clean-baseline, isolated-spike-during-idle-suppressed,
+isolated-spike-during-activity-still-fires, sustained-elevation-
+fires-regardless-of-link-activity, loss-alone-fires-even-during-
+idle, evidence-mentions-link-activity-state. Landmark-side, six
+new tests pin: gateway-flicker-suppressed, gateway-outage-commits-
+after-3-consecutive, wakeup-tagged-during-idle, alarm-during-
+recent-activity, throughput-short-burst-emits-nothing, sustained-
+burst-commits-after-hold, idle-to-trickle-dropped.
+
+`cargo test --workspace`: **115/115 green** (was 103, +12).
+
+**Smoke against a real recording.** `scripts/record.sh 30s`
+captured 30 s of typical macOS Wi-Fi (RTT median 8 ms, RX/TX peak
+≈100 Kbps). The new evidence lines appeared verbatim in the
+findings:
+
+```text
++   4.0s  Active      Gateway 192.168.50.1 unstable: 0% loss, p95 37 ms vs median 8 ms
+            • Elevated samples (>2.0× median): 1/5
+            • Link recently active (rolling RX/TX peak 131 Kbps)
++  20.0s  Escalating  …p95 85 ms vs median 8 ms — worsening
+            • Elevated samples (>2.0× median): 2/20
+            • Link recently idle (rolling RX/TX peak 26 Kbps)
+```
+
+The operator now sees *why* the rule fired (elevated sample
+count, recent link activity), not just *what* it concluded.
+
+**Untouched.** Bus shape, event model, sensors, lifecycle
+pipeline, observation confidence, session format, replay/strip/
+analyze/inspect/capture paths, scripts. The changes are purely
+within the rule body and the landmark deriver — no consumer of
+either ever sees a different surface.
+
 ### 2026-05-28 — Claude Opus 4.7 (capture sized by data window, not wall clock)
 
 **Pivot.** Operator-flagged that the previous `--warmup` flag in

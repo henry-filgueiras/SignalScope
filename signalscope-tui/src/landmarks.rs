@@ -89,14 +89,36 @@ pub enum LandmarkSeverity {
 /// Walk the recorded envelope stream and produce the ordered list of
 /// landmarks. Pure function — same input always yields the same
 /// output, by construction.
+///
+/// The deriver biases for **investigation-worthy moments**, not every
+/// state flip. Two mechanisms do most of the filtering:
+///
+/// * **Hold-time discipline.** A regime / stance change must persist
+///   for a minimum duration before it's "committed" as a transition
+///   worth landmarking. Brief flickers — a single elevated RTT
+///   sample, a 1-second idle blip during sustained traffic — produce
+///   no landmarks. The user-visible landmark anchors on the moment
+///   the regime *started*, not the moment we became confident.
+/// * **Selective emission.** Even after commit, only operationally
+///   meaningful transitions emit. Throughput `Idle ↔ Trickle`
+///   (background-traffic noise) is dropped entirely; `Sustained →
+///   Trickle` is dropped (the transfer slowing isn't actionable).
+///   Entering `Bursting`, entering `Sustained` from low activity,
+///   and recovering to `Idle` from high activity all stay.
+///
+/// Wakeup awareness: when a gateway stance flips to `Spiking` after
+/// a sustained-idle throughput period, the landmark is tagged
+/// `wakeup likely` with `Notable` severity instead of `Alarm`.
+/// Explainability preserved; false-alarm noise removed.
 pub fn derive(events: &[Arc<Envelope>]) -> Vec<TimelineLandmark> {
     let mut out = Vec::new();
     let mut health_prev: HashMap<SensorId, SensorState> = HashMap::new();
     let mut gw_window: VecDeque<f64> = VecDeque::with_capacity(GW_MEDIAN_WINDOW);
-    let mut gw_prev: Option<GwStance> = None;
+    let mut gw_hold = GwHold::default();
     let mut dns_prev: Option<DnsStance> = None;
-    let mut tput_prev: Option<ThroughputRegime> = None;
+    let mut tput_hold = ThroughputHold::default();
     let mut prev_counters: Option<(u64, u64, OffsetDateTime)> = None;
+    let mut last_active_at: Option<OffsetDateTime> = None;
 
     for (idx, env) in events.iter().enumerate() {
         match &env.event {
@@ -126,12 +148,19 @@ pub fn derive(events: &[Arc<Envelope>]) -> Vec<TimelineLandmark> {
                 }
                 let median = median_ms(&gw_window);
                 let stance = classify_gateway(o.reachable, ms, median);
-                if let Some(prev) = gw_prev {
-                    if prev != stance {
-                        out.push(landmark_for_gateway(env.at, idx, prev, stance, o.target.as_str(), ms));
-                    }
+                if let Some(committed) = gw_hold.observe(stance, env.at, idx, ms) {
+                    let wakeup_likely = matches!(stance, GwStance::Spiking)
+                        && link_was_idle(last_active_at, env.at);
+                    out.push(landmark_for_gateway(
+                        committed.at,
+                        committed.idx,
+                        committed.prev,
+                        stance,
+                        o.target.as_str(),
+                        committed.ms,
+                        wakeup_likely,
+                    ));
                 }
-                gw_prev = Some(stance);
             }
             Event::DnsLatency(o) => {
                 let stance = if o.answered {
@@ -161,14 +190,27 @@ pub fn derive(events: &[Arc<Envelope>]) -> Vec<TimelineLandmark> {
                         let tx_bps =
                             ((c.tx_bytes_total - prev_tx) as f64 / dt) * 8.0;
                         let regime = classify_throughput(rx_bps, tx_bps);
-                        if let Some(prev) = tput_prev {
-                            if prev != regime {
+                        // Track when the link was last in a non-idle
+                        // regime — the wakeup classifier reads this
+                        // to decide whether a gateway spike likely
+                        // came from a sleeping radio.
+                        if !matches!(regime, ThroughputRegime::Idle) {
+                            last_active_at = Some(env.at);
+                        }
+                        if let Some(committed) =
+                            tput_hold.observe(regime, env.at, idx, rx_bps, tx_bps)
+                        {
+                            if is_notable_throughput_transition(committed.prev, regime) {
                                 out.push(landmark_for_throughput(
-                                    env.at, idx, prev, regime, rx_bps, tx_bps,
+                                    committed.at,
+                                    committed.idx,
+                                    committed.prev.unwrap_or(regime),
+                                    regime,
+                                    committed.rx_bps,
+                                    committed.tx_bps,
                                 ));
                             }
                         }
-                        tput_prev = Some(regime);
                     }
                 }
                 prev_counters = Some((c.rx_bytes_total, c.tx_bytes_total, env.at));
@@ -182,6 +224,206 @@ pub fn derive(events: &[Arc<Envelope>]) -> Vec<TimelineLandmark> {
 
     out
 }
+
+/// True iff the link has been sustained-idle long enough that a
+/// fresh gateway spike likely reflects radio-wakeup latency rather
+/// than network instability. `last_active_at` is the most recent
+/// envelope timestamp at which we classified throughput as non-Idle.
+fn link_was_idle(last_active_at: Option<OffsetDateTime>, now: OffsetDateTime) -> bool {
+    match last_active_at {
+        None => true,
+        Some(t) => (now - t).whole_seconds() >= WAKEUP_IDLE_THRESHOLD_SECS,
+    }
+}
+
+/// Throughput regime hold-time tracker. Returns `Some` only when a
+/// new regime has held for `THROUGHPUT_HOLD_SECS` and differs from
+/// the previously-committed regime. The returned struct anchors on
+/// the *start* of the held regime so downstream landmarks point at
+/// the moment the change happened, not the moment we noticed.
+#[derive(Debug, Default)]
+struct ThroughputHold {
+    committed: Option<ThroughputRegime>,
+    candidate: Option<ThroughputCandidate>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThroughputCandidate {
+    regime: ThroughputRegime,
+    started_at: OffsetDateTime,
+    started_idx: usize,
+    started_rx_bps: f64,
+    started_tx_bps: f64,
+}
+
+struct ThroughputCommit {
+    prev: Option<ThroughputRegime>,
+    at: OffsetDateTime,
+    idx: usize,
+    rx_bps: f64,
+    tx_bps: f64,
+}
+
+impl ThroughputHold {
+    fn observe(
+        &mut self,
+        regime: ThroughputRegime,
+        at: OffsetDateTime,
+        idx: usize,
+        rx_bps: f64,
+        tx_bps: f64,
+    ) -> Option<ThroughputCommit> {
+        match self.candidate {
+            Some(c) if c.regime == regime => {} // candidate holds
+            _ => {
+                self.candidate = Some(ThroughputCandidate {
+                    regime,
+                    started_at: at,
+                    started_idx: idx,
+                    started_rx_bps: rx_bps,
+                    started_tx_bps: tx_bps,
+                });
+            }
+        }
+        let cand = self.candidate?;
+        let held = (at - cand.started_at).whole_seconds();
+        if held >= THROUGHPUT_HOLD_SECS && self.committed != Some(cand.regime) {
+            let prev = self.committed;
+            self.committed = Some(cand.regime);
+            Some(ThroughputCommit {
+                prev,
+                at: cand.started_at,
+                idx: cand.started_idx,
+                rx_bps: cand.started_rx_bps,
+                tx_bps: cand.started_tx_bps,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Operationally meaningful throughput transitions only. Everything
+/// else (idle↔trickle background blips, sustained→trickle slowdowns,
+/// bursting→sustained cooldowns) gets dropped — they're texture, not
+/// investigation triggers.
+fn is_notable_throughput_transition(
+    prev: Option<ThroughputRegime>,
+    new: ThroughputRegime,
+) -> bool {
+    use ThroughputRegime::*;
+    match (prev, new) {
+        // First commit at session start: only landmark unusual states.
+        // A recording that begins idle isn't a transition; one that
+        // begins mid-burst is.
+        (None, Bursting) => true,
+        (None, Sustained) => true,
+        (None, _) => false,
+        // Entering Bursting is always notable — that's the crest of
+        // activity worth investigating.
+        (Some(p), Bursting) if p != Bursting => true,
+        // Stepping up to sustained from a quiet baseline marks the
+        // start of real traffic.
+        (Some(Idle), Sustained) => true,
+        (Some(Trickle), Sustained) => true,
+        // Returning to idle from high activity marks the end of a
+        // transfer — useful for "when did things calm down?"
+        (Some(Bursting), Idle) => true,
+        (Some(Sustained), Idle) => true,
+        // Everything else is noise.
+        _ => false,
+    }
+}
+
+/// Gateway stance hold-time tracker. Same idea as `ThroughputHold`
+/// but counts consecutive samples (gateway probes are at 1 Hz) and
+/// emits per stance change.
+#[derive(Debug, Default)]
+struct GwHold {
+    committed: Option<GwStance>,
+    candidate: Option<GwCandidate>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GwCandidate {
+    stance: GwStance,
+    started_at: OffsetDateTime,
+    started_idx: usize,
+    started_ms: f64,
+    consecutive: usize,
+}
+
+struct GwCommit {
+    prev: Option<GwStance>,
+    at: OffsetDateTime,
+    idx: usize,
+    ms: f64,
+}
+
+impl GwHold {
+    fn observe(
+        &mut self,
+        stance: GwStance,
+        at: OffsetDateTime,
+        idx: usize,
+        ms: f64,
+    ) -> Option<GwCommit> {
+        match self.candidate {
+            Some(c) if c.stance == stance => {
+                let new = GwCandidate {
+                    consecutive: c.consecutive + 1,
+                    ..c
+                };
+                self.candidate = Some(new);
+            }
+            _ => {
+                self.candidate = Some(GwCandidate {
+                    stance,
+                    started_at: at,
+                    started_idx: idx,
+                    started_ms: ms,
+                    consecutive: 1,
+                });
+            }
+        }
+        let cand = self.candidate?;
+        if cand.consecutive >= GW_HOLD_CONSECUTIVE && self.committed != Some(cand.stance) {
+            let prev = self.committed;
+            self.committed = Some(cand.stance);
+            // The first stance we commit at session start is *not* a
+            // transition — it's the baseline. Don't landmark an
+            // uneventful opening. We do still landmark a session that
+            // opens already broken (Spiking / Unreachable) because the
+            // operator wants to see "we started in trouble."
+            if prev.is_none() && matches!(cand.stance, GwStance::Stable) {
+                return None;
+            }
+            Some(GwCommit {
+                prev,
+                at: cand.started_at,
+                idx: cand.started_idx,
+                ms: cand.started_ms,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// A throughput regime must hold for this many seconds before we
+/// commit it as a transition. Tuned to suppress 2–5 s flickers
+/// without lagging real regime changes too much.
+const THROUGHPUT_HOLD_SECS: i64 = 10;
+
+/// A gateway stance must hold for this many consecutive samples
+/// (~1 s each) before committing. Two-sample wakeup transients get
+/// suppressed; three-or-more-sample patterns commit.
+const GW_HOLD_CONSECUTIVE: usize = 3;
+
+/// Lookback for the wakeup-likely classifier. If the link's last
+/// non-idle moment was longer ago than this, a fresh gateway spike
+/// is treated as more-likely-than-not a radio wakeup.
+const WAKEUP_IDLE_THRESHOLD_SECS: i64 = 15;
 
 // ---------- finding ----------
 
@@ -264,23 +506,30 @@ fn classify_gateway(reachable: bool, ms: f64, median: Option<f64>) -> GwStance {
 fn landmark_for_gateway(
     at: OffsetDateTime,
     event_index: usize,
-    prev: GwStance,
+    prev: Option<GwStance>,
     new: GwStance,
     target: &str,
     ms: f64,
+    wakeup_likely: bool,
 ) -> TimelineLandmark {
+    // A spike after a sustained idle period reads more naturally as
+    // "the radio woke up" than "the gateway is unstable." Downgrade
+    // it to Notable severity so the landmarks pane reflects that
+    // distinction without hiding it from the operator.
     let severity = match new {
         GwStance::Stable => LandmarkSeverity::Recovery,
+        GwStance::Spiking if wakeup_likely => LandmarkSeverity::Notable,
         GwStance::Spiking => LandmarkSeverity::Alarm,
         GwStance::Unreachable => LandmarkSeverity::Alarm,
     };
-    let headline = match new {
-        GwStance::Stable => format!("Gateway recovered · {target} {ms:.1} ms"),
-        GwStance::Spiking => format!("Gateway spiking · {target} {ms:.1} ms"),
-        GwStance::Unreachable => format!("Gateway unreachable · {target}"),
+    let headline = match (new, wakeup_likely) {
+        (GwStance::Stable, _) => format!("Gateway recovered · {target} {ms:.1} ms"),
+        (GwStance::Spiking, true) => format!(
+            "Gateway latency rose · {target} {ms:.1} ms · wakeup likely"
+        ),
+        (GwStance::Spiking, false) => format!("Gateway spiking · {target} {ms:.1} ms"),
+        (GwStance::Unreachable, _) => format!("Gateway unreachable · {target}"),
     };
-    // Reference prev so the unused-binding lint stays quiet in case we
-    // grow more directional phrasing later.
     let _ = prev;
     TimelineLandmark {
         at,
@@ -547,7 +796,11 @@ mod tests {
     }
 
     #[test]
-    fn gateway_stance_change_to_unreachable_emits_landmark() {
+    fn gateway_stance_change_requires_three_consecutive_samples() {
+        // Two unreachable samples sandwiched between healthy ones don't
+        // commit the new stance — that's a brief flicker, not an outage
+        // worth landmarking. Below 3 consecutive samples the hold-time
+        // tracker keeps the stance at Stable.
         let events = vec![
             env(1, 0, gateway(2, true)),
             env(2, 1, gateway(3, true)),
@@ -557,16 +810,96 @@ mod tests {
             env(6, 5, gateway(2, true)),
         ];
         let landmarks = derive(&events);
-        // Transitions: Stable → Unreachable, Unreachable → Stable. Two
-        // landmarks; the two reachable-and-fine and two consecutive
-        // unreachables in the middle don't flip.
         let gw: Vec<_> = landmarks
             .iter()
             .filter(|l| l.category == LandmarkCategory::Gateway)
             .collect();
-        assert_eq!(gw.len(), 2, "got: {gw:?}");
+        assert!(
+            gw.is_empty(),
+            "two-sample flicker should NOT produce a landmark, got: {gw:?}"
+        );
+    }
+
+    #[test]
+    fn gateway_unreachable_commits_after_three_consecutive_samples() {
+        // Same shape but the outage now persists for the required hold.
+        let events = vec![
+            env(1, 0, gateway(2, true)),
+            env(2, 1, gateway(3, true)),
+            env(3, 2, gateway(2, true)),
+            env(4, 3, gateway(0, false)),
+            env(5, 4, gateway(0, false)),
+            env(6, 5, gateway(0, false)), // third consecutive → commit
+            env(7, 6, gateway(0, false)),
+            env(8, 7, gateway(2, true)),
+            env(9, 8, gateway(2, true)),
+            env(10, 9, gateway(2, true)), // third Stable → commit recovery
+        ];
+        let landmarks = derive(&events);
+        let gw: Vec<_> = landmarks
+            .iter()
+            .filter(|l| l.category == LandmarkCategory::Gateway)
+            .collect();
+        assert_eq!(gw.len(), 2, "expected one outage + one recovery, got: {gw:?}");
         assert!(gw[0].headline.contains("unreachable"));
         assert!(gw[1].headline.contains("recovered"));
+        // Landmark anchors on the *start* of the held stance, not the
+        // moment we became confident — so the Unreachable landmark
+        // points at event 4 (first unreachable sample), not event 6.
+        assert_eq!(gw[0].event_index, 3, "first unreachable sample, not the commit point");
+    }
+
+    #[test]
+    fn gateway_spike_after_idle_is_tagged_as_wakeup_likely() {
+        // Stable baseline, then a sustained spike, but throughput is
+        // idle the whole time. The Spiking landmark should downgrade
+        // to Notable severity with a "wakeup likely" headline.
+        let mut events = vec![
+            // Establish baseline median.
+            env(1, 0, gateway(2, true)),
+            env(2, 1, gateway(3, true)),
+            env(3, 2, gateway(2, true)),
+            env(4, 3, gateway(3, true)),
+            env(5, 4, gateway(2, true)),
+            // No throughput data → link_was_idle defaults to true.
+        ];
+        // Sustained spike: 3 consecutive elevated samples to satisfy hold.
+        for i in 0..3 {
+            events.push(env(6 + i, 5 + i as i64, gateway(120, true)));
+        }
+        let landmarks = derive(&events);
+        let spike = landmarks
+            .iter()
+            .find(|l| l.category == LandmarkCategory::Gateway && l.headline.contains("rose"))
+            .expect("expected a wakeup-tagged spike landmark");
+        assert_eq!(spike.severity, LandmarkSeverity::Notable);
+        assert!(spike.headline.contains("wakeup likely"));
+    }
+
+    #[test]
+    fn gateway_spike_during_recent_activity_keeps_alarm_severity() {
+        // Same spike pattern, but with throughput observations that
+        // mark the link active in the lead-up. No wakeup downgrade.
+        let mut events = Vec::new();
+        // A counter observation indicating recent traffic — peak rate
+        // well above the idle floor.
+        events.push(env(100, 0, counters(0, 0)));
+        events.push(env(101, 1, counters(1_000_000, 0))); // 8 Mbps → not idle
+        // Now the gateway baseline + spike pattern, all within the
+        // wakeup window so last_active_at is recent.
+        for i in 0..5 {
+            events.push(env(i + 2, 2 + i as i64, gateway(2, true)));
+        }
+        for i in 0..3 {
+            events.push(env(i + 200, 7 + i as i64, gateway(120, true)));
+        }
+        let landmarks = derive(&events);
+        let spike = landmarks
+            .iter()
+            .find(|l| l.category == LandmarkCategory::Gateway && l.headline.contains("spiking"))
+            .expect("expected an alarm-tagged spike");
+        assert_eq!(spike.severity, LandmarkSeverity::Alarm);
+        assert!(!spike.headline.contains("wakeup"));
     }
 
     #[test]
@@ -591,22 +924,65 @@ mod tests {
     }
 
     #[test]
-    fn throughput_regime_change_emits_landmark() {
-        // Two quiet samples then a burst.
-        // 25 MB jump over 1 s = 200 Mbps → Bursting (≥ 25 Mbps threshold).
+    fn throughput_burst_below_hold_time_emits_nothing() {
+        // A 2 s burst gets dropped — under the 10 s hold-time floor,
+        // it reads as transient, not a regime change worth investigating.
         let events = vec![
             env(1, 0, counters(1_000, 0)),
             env(2, 1, counters(1_500, 0)),
             env(3, 2, counters(26_000_000, 0)),
         ];
-        let landmarks = derive(&events);
-        let t: Vec<_> = landmarks
-            .iter()
+        let t: Vec<_> = derive(&events)
+            .into_iter()
             .filter(|l| l.category == LandmarkCategory::Throughput)
             .collect();
-        assert_eq!(t.len(), 1, "expected one regime flip, got: {t:?}");
-        assert!(t[0].headline.contains("bursting"));
-        assert_eq!(t[0].severity, LandmarkSeverity::Notable);
+        assert!(t.is_empty(), "short burst should not landmark, got: {t:?}");
+    }
+
+    #[test]
+    fn throughput_sustained_burst_commits_after_hold_time() {
+        // Long sustained burst (>10 s). Should produce one Bursting
+        // landmark anchored at the moment the burst started, not the
+        // moment we became confident.
+        let mut events = vec![env(1, 0, counters(0, 0))];
+        // 12 seconds of 8 Mbps growth — well into Sustained range.
+        for i in 1..=12 {
+            events.push(env(1 + i as u64, i, counters((i as u64) * 1_000_000, 0)));
+        }
+        // Then keep going so the hold-time triggers.
+        events.push(env(99, 13, counters(13_000_000, 0)));
+        let t: Vec<_> = derive(&events)
+            .into_iter()
+            .filter(|l| l.category == LandmarkCategory::Throughput)
+            .collect();
+        assert_eq!(t.len(), 1, "expected one sustained landmark, got: {t:?}");
+        assert!(t[0].headline.contains("sustained"));
+    }
+
+    #[test]
+    fn idle_to_trickle_transition_is_dropped() {
+        // Trickle (background keepalive traffic) blinking from idle is
+        // texture, not investigation-worthy. The hold-time would let it
+        // commit eventually, but `is_notable_throughput_transition`
+        // filters it out at emission time.
+        let mut events = vec![env(1, 0, counters(0, 0))];
+        // 15 s of trickle traffic: 100 Kbps = above Idle (50 K) below
+        // Sustained (500 K).
+        for i in 1..=15 {
+            events.push(env(
+                1 + i as u64,
+                i,
+                counters((i as u64) * 12_500, 0),
+            ));
+        }
+        let t: Vec<_> = derive(&events)
+            .into_iter()
+            .filter(|l| l.category == LandmarkCategory::Throughput)
+            .collect();
+        assert!(
+            t.is_empty(),
+            "idle → trickle should be silent, got: {t:?}"
+        );
     }
 
     #[test]

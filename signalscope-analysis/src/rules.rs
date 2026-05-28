@@ -16,7 +16,10 @@ use std::time::Duration;
 use signalscope_events::FindingKind;
 use time::OffsetDateTime;
 
-use crate::windows::{DnsWindow, GatewayWindow, RfEnvironmentWindow, WifiSignalWindow, WifiState};
+use crate::windows::{
+    DnsWindow, GatewayWindow, InterfaceThroughputWindow, RfEnvironmentWindow, WifiSignalWindow,
+    WifiState,
+};
 
 /// Lookback window for the connected-link signal trend. Long enough to
 /// average out per-sample noise, short enough to feel responsive.
@@ -32,6 +35,20 @@ const SIGNAL_TREND_DB: f64 = 5.0;
 
 /// Minimum AP-count delta that counts as a real density shift.
 const DENSITY_TREND_APS: f64 = 3.0;
+
+/// A gateway RTT sample counts as "elevated" when it sits above this
+/// multiple of the window's median. Tuned to catch real outliers
+/// without firing on per-sample noise.
+const GW_ELEVATED_MULT: f64 = 2.0;
+
+/// Maximum elevated-sample count that we'll treat as an *isolated*
+/// outlier (potential wakeup latency) rather than sustained instability.
+const GW_ISOLATED_MAX: usize = 1;
+
+/// Peak rolling RX/TX throughput below which we consider the link to
+/// have been idle. Matches the dashboard/landmark idle floor so the
+/// rule and the visual story agree.
+const LINK_IDLE_BPS: f64 = 50_000.0;
 
 /// A finding as produced by a rule, before the lifecycle layer has
 /// decided what (if anything) to publish.
@@ -51,13 +68,14 @@ pub fn evaluate(
     dns: &DnsWindow,
     signal: &WifiSignalWindow,
     env: &RfEnvironmentWindow,
+    throughput: &InterfaceThroughputWindow,
     now: OffsetDateTime,
 ) -> Vec<CandidateFinding> {
     let mut out = Vec::new();
     if let Some(f) = rf_congestion(wifi) {
         out.push(f);
     }
-    if let Some(f) = gateway_instability(gateway) {
+    if let Some(f) = gateway_instability(gateway, throughput) {
         out.push(f);
     }
     if let Some(f) = dns_pathology(dns, gateway) {
@@ -236,6 +254,145 @@ mod tests {
         assert!(f.headline.contains("elevated"));
     }
 
+    // ---------- gateway_instability ----------
+
+    fn gw_sample(rtt_ms: u64, reachable: bool) -> signalscope_events::GatewayLatencyObservation {
+        signalscope_events::GatewayLatencyObservation {
+            target: "192.168.1.1".into(),
+            rtt: std::time::Duration::from_millis(rtt_ms),
+            reachable,
+            probe: "icmp".into(),
+        }
+    }
+
+    fn gw_window(rtts_ms: &[u64]) -> GatewayWindow {
+        let mut w = GatewayWindow::new(std::time::Duration::from_secs(60));
+        for ms in rtts_ms {
+            w.record(&gw_sample(*ms, true));
+        }
+        w
+    }
+
+    fn gw_window_with_loss(rtts_ms: &[(u64, bool)]) -> GatewayWindow {
+        let mut w = GatewayWindow::new(std::time::Duration::from_secs(60));
+        for (ms, reachable) in rtts_ms {
+            w.record(&gw_sample(*ms, *reachable));
+        }
+        w
+    }
+
+    fn empty_throughput() -> InterfaceThroughputWindow {
+        InterfaceThroughputWindow::new(std::time::Duration::from_secs(15))
+    }
+
+    fn active_throughput() -> InterfaceThroughputWindow {
+        use signalscope_events::InterfaceCountersObservation;
+        let mut w = InterfaceThroughputWindow::new(std::time::Duration::from_secs(15));
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        // 0 → 10 MB over 10 seconds = 8 Mbps. Well above the 50 Kbps idle floor.
+        let mk = |rx: u64| InterfaceCountersObservation {
+            interface: "en0".into(),
+            rx_bytes_total: rx,
+            tx_bytes_total: 0,
+            rx_packets_total: 0,
+            tx_packets_total: 0,
+            rx_errors_total: 0,
+            tx_errors_total: 0,
+            rx_dropped_total: None,
+            tx_dropped_total: None,
+            retry_count: None,
+        };
+        w.record(&mk(0), now);
+        w.record(&mk(10_000_000), now + time::Duration::seconds(10));
+        w
+    }
+
+    #[test]
+    fn gateway_stays_silent_with_too_few_samples() {
+        let gw = gw_window(&[5, 5, 5, 5]); // only 4
+        let tput = empty_throughput();
+        assert!(gateway_instability(&gw, &tput).is_none());
+    }
+
+    #[test]
+    fn gateway_stays_silent_on_clean_baseline() {
+        let gw = gw_window(&[5, 6, 5, 5, 6, 5, 5, 6, 5, 5]);
+        let tput = empty_throughput();
+        assert!(gateway_instability(&gw, &tput).is_none());
+    }
+
+    #[test]
+    fn isolated_spike_during_idle_does_not_fire() {
+        // 9 samples at 5ms, one wakeup spike at 80ms. Jitter ratio is
+        // huge (p95 ≈ 80, median 5 → 16×) but only ONE elevated sample,
+        // and the link is idle → suppress as likely wakeup.
+        let gw = gw_window(&[5, 5, 5, 5, 5, 5, 5, 5, 5, 80]);
+        let tput = empty_throughput(); // idle
+        assert!(
+            gateway_instability(&gw, &tput).is_none(),
+            "isolated p95 spike during idle should be silent"
+        );
+    }
+
+    #[test]
+    fn isolated_spike_during_activity_still_fires() {
+        // Same outlier, but the link is busy. The wakeup-latency
+        // explanation doesn't apply, so we still surface the spike.
+        let gw = gw_window(&[5, 5, 5, 5, 5, 5, 5, 5, 5, 80]);
+        let tput = active_throughput();
+        assert!(
+            gateway_instability(&gw, &tput).is_some(),
+            "spike during active link doesn't get the wakeup pass"
+        );
+    }
+
+    #[test]
+    fn sustained_elevation_fires_regardless_of_link_activity() {
+        // Majority of samples at baseline (so median stays low), with
+        // multiple elevated outliers — that's "no longer isolated",
+        // regardless of whether the link was idle. This is the
+        // genuine-instability path we never want to silence.
+        let gw = gw_window(&[5, 5, 5, 5, 5, 5, 5, 5, 80, 90]);
+        let tput = empty_throughput(); // even idle
+        let finding = gateway_instability(&gw, &tput).expect("should fire");
+        assert!(finding
+            .evidence
+            .iter()
+            .any(|e| e.contains("Elevated samples")));
+    }
+
+    #[test]
+    fn loss_alone_fires_even_during_idle() {
+        // Loss is a hard failure mode regardless of link activity.
+        // 4/10 = 40% loss → above the 5% threshold.
+        let gw = gw_window_with_loss(&[
+            (5, true), (5, true), (0, false), (5, true),
+            (0, false), (5, true), (0, false), (5, true),
+            (0, false), (5, true),
+        ]);
+        let tput = empty_throughput();
+        let finding = gateway_instability(&gw, &tput).expect("loss must fire");
+        assert!(finding.confidence > 0.3);
+    }
+
+    #[test]
+    fn evidence_mentions_link_activity_state() {
+        // Same shape as the sustained-elevation test — baseline median
+        // with two elevated samples — so we get past the isolated-spike
+        // suppression and into the firing path where evidence is built.
+        let gw = gw_window(&[5, 5, 5, 5, 5, 5, 5, 5, 80, 90]);
+        let idle_finding = gateway_instability(&gw, &empty_throughput()).unwrap();
+        assert!(
+            idle_finding.evidence.iter().any(|e| e.contains("idle")),
+            "evidence should name the idle context"
+        );
+        let active_finding = gateway_instability(&gw, &active_throughput()).unwrap();
+        assert!(
+            active_finding.evidence.iter().any(|e| e.contains("active")),
+            "evidence should name the active context"
+        );
+    }
+
     #[test]
     fn congestion_fingerprint_follows_connected_channel() {
         let neighbors_a: Vec<NeighborAp> = (0..7).map(|_| neighbor_on(11)).collect();
@@ -251,7 +408,21 @@ mod tests {
     }
 }
 
-fn gateway_instability(gateway: &GatewayWindow) -> Option<CandidateFinding> {
+/// Gateway-instability rule. Fires when loss is meaningful OR when
+/// multiple samples sit well above the window's median.
+///
+/// The second condition used to be `p95 / median ≥ 4×`, which fired
+/// on a *single* big outlier — a pattern that often corresponds to
+/// Wi-Fi power-save wakeup latency rather than network instability.
+/// The rule now requires either real loss or **more than one elevated
+/// sample**, and additionally suppresses isolated p95 spikes when the
+/// link was idle in the window's lead-up. That preserves explainability
+/// (the operator gets an `idle link` evidence line when relevant) while
+/// removing the most common false-alarm pattern in replay.
+fn gateway_instability(
+    gateway: &GatewayWindow,
+    throughput: &InterfaceThroughputWindow,
+) -> Option<CandidateFinding> {
     if gateway.len() < 5 {
         return None;
     }
@@ -260,7 +431,21 @@ fn gateway_instability(gateway: &GatewayWindow) -> Option<CandidateFinding> {
     let p95 = gateway.p95_rtt_ms()?;
     let jitter_ratio = if median > 0.0 { p95 / median } else { 1.0 };
 
+    // Cheap reject: nothing looks elevated at all.
     if loss < 0.05 && jitter_ratio < 4.0 {
+        return None;
+    }
+
+    let elevated = gateway.samples_above_ms(median * GW_ELEVATED_MULT);
+    let link_idle = link_is_idle(throughput);
+    let isolated_spike = elevated <= GW_ISOLATED_MAX;
+
+    // The wakeup-latency suppression. If the only signal is a single
+    // elevated sample and the link was idle in the window, this almost
+    // certainly is a radio waking up, not gateway instability. Stay
+    // silent rather than emit a finding the operator would have to
+    // investigate and dismiss.
+    if isolated_spike && link_idle && loss < 0.05 {
         return None;
     }
 
@@ -268,6 +453,25 @@ fn gateway_instability(gateway: &GatewayWindow) -> Option<CandidateFinding> {
         .clamp(0.0, 0.95) as f32;
 
     let target = gateway.target().unwrap_or("gateway");
+    let mut evidence = vec![
+        format!("Loss ratio: {:.2}", loss),
+        format!("Median RTT: {:.1} ms", median),
+        format!("p95 RTT: {:.1} ms", p95),
+        format!(
+            "Elevated samples (>{:.1}× median): {}/{}",
+            GW_ELEVATED_MULT,
+            elevated,
+            gateway.len()
+        ),
+    ];
+    // Surface link-activity context so the operator can judge — this
+    // rule's noisiest false-positive class is "elevated RTT after the
+    // radio woke from power-save."
+    evidence.push(format!(
+        "Link recently {} (rolling RX/TX peak {})",
+        if link_idle { "idle" } else { "active" },
+        link_peak_label(throughput),
+    ));
 
     Some(CandidateFinding {
         kind: FindingKind::GatewayInstability,
@@ -279,13 +483,35 @@ fn gateway_instability(gateway: &GatewayWindow) -> Option<CandidateFinding> {
             median
         ),
         confidence,
-        evidence: vec![
-            format!("Loss ratio: {:.2}", loss),
-            format!("Median RTT: {:.1} ms", median),
-            format!("p95 RTT: {:.1} ms", p95),
-            format!("Samples in window: {}", gateway.len()),
-        ],
+        evidence,
     })
+}
+
+/// Whether the link's recent rolling throughput peak (RX or TX) sits
+/// below the idle floor. We use the rolling-average view rather than
+/// the per-step view: a single burst sample shouldn't flip this from
+/// "idle" to "active" — sustained traffic should.
+fn link_is_idle(throughput: &InterfaceThroughputWindow) -> bool {
+    match throughput.throughput_bps() {
+        Some(t) => t.rx_bps.max(t.tx_bps) < LINK_IDLE_BPS,
+        None => true,
+    }
+}
+
+fn link_peak_label(throughput: &InterfaceThroughputWindow) -> String {
+    match throughput.throughput_bps() {
+        Some(t) => {
+            let bps = t.rx_bps.max(t.tx_bps);
+            if bps >= 1.0e6 {
+                format!("{:.1} Mbps", bps / 1.0e6)
+            } else if bps >= 1.0e3 {
+                format!("{:.0} Kbps", bps / 1.0e3)
+            } else {
+                "idle".into()
+            }
+        }
+        None => "no data".into(),
+    }
 }
 
 fn dns_pathology(dns: &DnsWindow, gateway: &GatewayWindow) -> Option<CandidateFinding> {

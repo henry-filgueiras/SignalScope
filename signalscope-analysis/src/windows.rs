@@ -163,6 +163,18 @@ impl GatewayWindow {
         let idx = ((v.len() as f64) * 0.95).floor() as usize;
         Some(v[idx.min(v.len() - 1)])
     }
+
+    /// Count of *reachable* samples in the window whose RTT exceeds
+    /// `threshold_ms`. Lets the instability rule distinguish "one big
+    /// outlier" (isolated spike, often wakeup latency) from "many
+    /// elevated samples" (sustained instability) — the difference
+    /// matters operationally.
+    pub fn samples_above_ms(&self, threshold_ms: f64) -> usize {
+        self.samples
+            .iter()
+            .filter(|s| s.reachable && s.rtt.as_secs_f64() * 1000.0 > threshold_ms)
+            .count()
+    }
 }
 
 #[derive(Debug, Clone)]

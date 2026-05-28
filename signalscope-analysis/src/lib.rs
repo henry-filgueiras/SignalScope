@@ -138,14 +138,14 @@ impl AnalysisEngine {
                     }
 
                     if triggers_rule_evaluation(&envelope.event) {
-                        self.evaluate(&wifi, &gateway, &dns, &signal, &env_window, &mut tracker);
+                        self.evaluate(&wifi, &gateway, &dns, &signal, &env_window, &throughput, &mut tracker);
                     }
                 }
                 _ = tick.tick() => {
                     // Periodic safety net: even with no incoming events,
                     // re-evaluate so resolutions and quiescent transitions
                     // get a chance to fire.
-                    self.evaluate(&wifi, &gateway, &dns, &signal, &env_window, &mut tracker);
+                    self.evaluate(&wifi, &gateway, &dns, &signal, &env_window, &throughput, &mut tracker);
                 }
             }
         }
@@ -158,10 +158,11 @@ impl AnalysisEngine {
         dns: &DnsWindow,
         signal: &WifiSignalWindow,
         env: &RfEnvironmentWindow,
+        throughput: &InterfaceThroughputWindow,
         tracker: &mut LifecycleTracker,
     ) {
         let now = OffsetDateTime::now_utc();
-        let candidates = rules::evaluate(wifi, gateway, dns, signal, env, now);
+        let candidates = rules::evaluate(wifi, gateway, dns, signal, env, throughput, now);
         for finding in tracker.step(candidates, now) {
             self.publish_finding(finding);
         }
