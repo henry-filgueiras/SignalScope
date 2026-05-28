@@ -15,8 +15,8 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use signalscope_events::{
-    Bssid, DnsLatencyObservation, GatewayLatencyObservation, NeighborAp, RoamDetected,
-    ScanResult, Ssid, WifiObservation,
+    Bssid, DnsLatencyObservation, GatewayLatencyObservation, InterfaceCountersObservation,
+    NeighborAp, RoamDetected, ScanResult, Ssid, WifiObservation,
 };
 use time::OffsetDateTime;
 
@@ -450,6 +450,136 @@ impl RfEnvironmentWindow {
     }
 }
 
+// ============================================================================
+// Interface throughput window
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct InterfaceCounterSample {
+    pub at: OffsetDateTime,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_errors: u64,
+    pub tx_errors: u64,
+}
+
+/// Successive cumulative-counter samples for a single interface. The
+/// window forgets samples older than `span` and resets entirely if it
+/// observes a non-monotonic byte total (interface reset, sysinfo refresh
+/// after a reload, counter wrap on a 32-bit driver). Throughput is
+/// computed as `(latest - earliest_in_window) / dt`, deliberately *no*
+/// extra smoothing — over-smoothing would mask the bursty failures the
+/// observatory is built to make visible.
+#[derive(Debug)]
+pub struct InterfaceThroughputWindow {
+    span: Duration,
+    interface: Option<String>,
+    samples: VecDeque<InterfaceCounterSample>,
+}
+
+impl InterfaceThroughputWindow {
+    pub fn new(span: Duration) -> Self {
+        Self {
+            span,
+            interface: None,
+            samples: VecDeque::new(),
+        }
+    }
+
+    pub fn record(&mut self, obs: &InterfaceCountersObservation, at: OffsetDateTime) {
+        // If the interface name changes (e.g. handoff from en0 → en7),
+        // discard the prior history — the counter spaces are unrelated.
+        if self.interface.as_deref() != Some(obs.interface.as_str()) {
+            self.interface = Some(obs.interface.clone());
+            self.samples.clear();
+        }
+        // Detect non-monotonic counters and reset. Cumulative counters can
+        // only go up; if they don't, the interface reset (or sysinfo
+        // re-baselined) and the old samples are not comparable.
+        if let Some(last) = self.samples.back() {
+            if obs.rx_bytes_total < last.rx_bytes || obs.tx_bytes_total < last.tx_bytes {
+                self.samples.clear();
+            }
+        }
+        self.samples.push_back(InterfaceCounterSample {
+            at,
+            rx_bytes: obs.rx_bytes_total,
+            tx_bytes: obs.tx_bytes_total,
+            rx_errors: obs.rx_errors_total,
+            tx_errors: obs.tx_errors_total,
+        });
+        self.evict(at);
+    }
+
+    /// Forget any retained state. Used when the sensor reports the
+    /// interface is gone / stale.
+    pub fn forget(&mut self) {
+        self.interface = None;
+        self.samples.clear();
+    }
+
+    fn evict(&mut self, now: OffsetDateTime) {
+        let cutoff = now - self.span;
+        while self.samples.len() > 2 {
+            match self.samples.front() {
+                Some(front) if front.at < cutoff => {
+                    self.samples.pop_front();
+                }
+                _ => break,
+            }
+        }
+    }
+
+    pub fn interface(&self) -> Option<&str> {
+        self.interface.as_deref()
+    }
+
+    pub fn sample_count(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn latest(&self) -> Option<&InterfaceCounterSample> {
+        self.samples.back()
+    }
+
+    /// Bytes-per-second over the window. `None` until we have at least
+    /// two samples spaced ≥1 second apart.
+    pub fn throughput_bps(&self) -> Option<Throughput> {
+        let last = self.samples.back()?;
+        let first = self.samples.front()?;
+        let dt = (last.at - first.at).as_seconds_f64();
+        if dt < 1.0 {
+            return None;
+        }
+        Some(Throughput {
+            rx_bps: ((last.rx_bytes - first.rx_bytes) as f64 / dt) * 8.0,
+            tx_bps: ((last.tx_bytes - first.tx_bytes) as f64 / dt) * 8.0,
+            sample_span: Duration::from_secs(dt as u64),
+        })
+    }
+
+    /// Combined error count over the window — sum of RX + TX errors that
+    /// accrued between the earliest and latest sample.
+    pub fn errors_in_window(&self) -> Option<u64> {
+        let last = self.samples.back()?;
+        let first = self.samples.front()?;
+        Some(
+            last.rx_errors.saturating_sub(first.rx_errors)
+                + last.tx_errors.saturating_sub(first.tx_errors),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Throughput {
+    /// Receive throughput in bits/sec.
+    pub rx_bps: f64,
+    /// Transmit throughput in bits/sec.
+    pub tx_bps: f64,
+    /// Wall-clock interval the derivation spans.
+    pub sample_span: Duration,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,5 +678,93 @@ mod tests {
         let mut w = RfEnvironmentWindow::new(Duration::from_secs(300));
         w.record(&synthetic_scan(5), ts(-10));
         assert!(w.density_delta(Duration::from_secs(60), ts(0)).is_none());
+    }
+
+    fn counters(iface: &str, rx: u64, tx: u64) -> InterfaceCountersObservation {
+        InterfaceCountersObservation {
+            interface: iface.into(),
+            rx_bytes_total: rx,
+            tx_bytes_total: tx,
+            rx_packets_total: 0,
+            tx_packets_total: 0,
+            rx_errors_total: 0,
+            tx_errors_total: 0,
+            rx_dropped_total: None,
+            tx_dropped_total: None,
+            retry_count: None,
+        }
+    }
+
+    #[test]
+    fn throughput_window_returns_none_until_one_second_spans() {
+        let mut w = InterfaceThroughputWindow::new(Duration::from_secs(60));
+        w.record(&counters("en0", 1_000, 100), ts(0));
+        // Only one sample → no throughput yet.
+        assert!(w.throughput_bps().is_none());
+    }
+
+    #[test]
+    fn throughput_window_derives_bps_from_byte_delta() {
+        let mut w = InterfaceThroughputWindow::new(Duration::from_secs(60));
+        // 1 MB rx and 100 KB tx accrued over 10 s →
+        //   rx = 1_000_000 B/10 s = 100_000 B/s = 800_000 bps
+        //   tx = 100_000 B/10 s   = 10_000 B/s  = 80_000 bps
+        w.record(&counters("en0", 1_000_000, 100_000), ts(0));
+        w.record(&counters("en0", 2_000_000, 200_000), ts(10));
+        let t = w.throughput_bps().expect("expected throughput");
+        assert!(
+            (t.rx_bps - 800_000.0).abs() < 1.0,
+            "rx wrong: {}",
+            t.rx_bps
+        );
+        assert!((t.tx_bps - 80_000.0).abs() < 1.0, "tx wrong: {}", t.tx_bps);
+    }
+
+    #[test]
+    fn throughput_window_resets_on_interface_swap() {
+        let mut w = InterfaceThroughputWindow::new(Duration::from_secs(60));
+        w.record(&counters("en0", 1_000, 100), ts(0));
+        w.record(&counters("en0", 2_000, 200), ts(5));
+        w.record(&counters("en7", 50, 10), ts(10));
+        // After interface swap, only the new sample survives → not enough
+        // data to derive throughput.
+        assert_eq!(w.sample_count(), 1);
+        assert_eq!(w.interface(), Some("en7"));
+        assert!(w.throughput_bps().is_none());
+    }
+
+    #[test]
+    fn throughput_window_resets_on_counter_decrease() {
+        // Simulates a driver reload / counter rebaseline.
+        let mut w = InterfaceThroughputWindow::new(Duration::from_secs(60));
+        w.record(&counters("en0", 1_000_000, 100_000), ts(0));
+        w.record(&counters("en0", 2_000_000, 200_000), ts(5));
+        // rx counter decreased — interface reset.
+        w.record(&counters("en0", 500, 50), ts(10));
+        assert_eq!(w.sample_count(), 1);
+        assert!(w.throughput_bps().is_none());
+    }
+
+    #[test]
+    fn throughput_window_evicts_old_samples_but_keeps_minimum_two() {
+        let mut w = InterfaceThroughputWindow::new(Duration::from_secs(30));
+        // 1 MB/s rx baseline: each 5-s sample steps by 5_000_000 bytes.
+        for offset in 0..10 {
+            w.record(
+                &counters("en0", (offset * 5_000_000) as u64, 0),
+                ts(offset * 5),
+            );
+        }
+        // After 50 s of samples with a 30-s span, oldest should be
+        // evicted but we still hold a window long enough to derive rate.
+        assert!(w.sample_count() >= 2);
+        let t = w.throughput_bps().expect("expected throughput");
+        // 1 MB/s = 8_000_000 bps. Rate should be stable even after
+        // eviction because the relationship between bytes and dt is.
+        assert!(
+            (t.rx_bps - 8_000_000.0).abs() < 10_000.0,
+            "rx wrong: {}",
+            t.rx_bps
+        );
     }
 }

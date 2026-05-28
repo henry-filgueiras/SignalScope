@@ -10,6 +10,7 @@ use signalscope_core::{spawn_recorder, EventBus, SessionHeader, SessionWriter};
 use signalscope_sensors::{
     dns::{DnsSensor, DnsSensorConfig},
     gateway::{GatewaySensor, GatewaySensorConfig},
+    iface::{InterfaceSensor, InterfaceSensorConfig},
     wifi::{WifiSensor, WifiSensorConfig},
     SensorScheduler,
 };
@@ -73,6 +74,10 @@ async fn run_observe(opts: ObserveOptions) -> Result<()> {
         GatewaySensor::new(GatewaySensorConfig::default()),
     );
     scheduler.add(bus.clone(), DnsSensor::new(DnsSensorConfig::default()));
+    scheduler.add(
+        bus.clone(),
+        InterfaceSensor::new(InterfaceSensorConfig::default()),
+    );
 
     let analysis = AnalysisEngine::new(bus.clone()).spawn();
 

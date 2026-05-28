@@ -27,6 +27,7 @@ use signalscope_events::Event;
 use signalscope_sensors::{
     dns::{DnsSensor, DnsSensorConfig},
     gateway::{GatewaySensor, GatewaySensorConfig},
+    iface::{InterfaceSensor, InterfaceSensorConfig},
     wifi::{WifiSensor, WifiSensorConfig},
     SensorScheduler,
 };
@@ -63,6 +64,10 @@ pub async fn run(opts: CaptureOptions) -> Result<()> {
         GatewaySensor::new(GatewaySensorConfig::default()),
     );
     scheduler.add(bus.clone(), DnsSensor::new(DnsSensorConfig::default()));
+    scheduler.add(
+        bus.clone(),
+        InterfaceSensor::new(InterfaceSensorConfig::default()),
+    );
 
     let analysis = AnalysisEngine::new(bus.clone()).spawn();
 
@@ -113,9 +118,9 @@ async fn status_loop(bus: Arc<EventBus>) {
             }
             _ = ticker.tick() => {
                 eprintln!(
-                    "  wifi={} scan={} gw={} dns={} find={} health={}",
+                    "  wifi={} scan={} gw={} dns={} iface={} find={} health={}",
                     tally.wifi, tally.scan, tally.gateway, tally.dns,
-                    tally.findings, tally.health,
+                    tally.iface, tally.findings, tally.health,
                 );
             }
         }
@@ -128,6 +133,7 @@ struct Tally {
     scan: u64,
     gateway: u64,
     dns: u64,
+    iface: u64,
     findings: u64,
     health: u64,
 }
@@ -139,6 +145,7 @@ impl Tally {
             Event::Scan(_) => self.scan += 1,
             Event::GatewayLatency(_) => self.gateway += 1,
             Event::DnsLatency(_) => self.dns += 1,
+            Event::InterfaceCounters(_) => self.iface += 1,
             Event::Finding(_) => self.findings += 1,
             Event::SensorHealth(_) => self.health += 1,
             Event::InterfaceStateChanged(_) | Event::RoamDetected(_) => {}

@@ -79,6 +79,38 @@ pub struct InterfaceStateChanged {
     pub current: InterfaceState,
 }
 
+/// Cumulative interface counters at a point in time.
+///
+/// All `*_total` fields are *cumulative since the interface came up*, not
+/// deltas — derivation of throughput / loss / error rates is the analysis
+/// layer's job, working off successive observations.
+///
+/// `*_dropped` and `retry_count` are `Option<u64>` rather than required: on
+/// modern macOS sysinfo-style userspace backends don't expose dropped
+/// counters, and retry statistics are 802.11-specific and only reachable
+/// through deeper integrations (Linux nl80211, monitor mode, future
+/// platform work). Keeping them optional lets richer backends populate
+/// them later without an event-model migration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterfaceCountersObservation {
+    pub interface: String,
+    pub rx_bytes_total: u64,
+    pub tx_bytes_total: u64,
+    pub rx_packets_total: u64,
+    pub tx_packets_total: u64,
+    pub rx_errors_total: u64,
+    pub tx_errors_total: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_dropped_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_dropped_total: Option<u64>,
+    /// 802.11 retransmission count. Populated only by backends that can
+    /// see it (monitor mode, nl80211 station stats). `None` from the
+    /// userspace counter path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_count: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InterfaceState {
     Unknown,
@@ -211,6 +243,7 @@ pub enum Event {
     GatewayLatency(GatewayLatencyObservation),
     DnsLatency(DnsLatencyObservation),
     InterfaceStateChanged(InterfaceStateChanged),
+    InterfaceCounters(InterfaceCountersObservation),
     RoamDetected(RoamDetected),
     Finding(CorrelationFinding),
     SensorHealth(SensorHealth),
@@ -222,7 +255,9 @@ impl Event {
             Event::Wifi(_) | Event::Scan(_) => EventCategory::Wifi,
             Event::GatewayLatency(_) => EventCategory::Gateway,
             Event::DnsLatency(_) => EventCategory::Dns,
-            Event::InterfaceStateChanged(_) => EventCategory::Interface,
+            Event::InterfaceStateChanged(_) | Event::InterfaceCounters(_) => {
+                EventCategory::Interface
+            }
             Event::RoamDetected(_) => EventCategory::Roam,
             Event::Finding(_) => EventCategory::Finding,
             Event::SensorHealth(_) => EventCategory::Health,

@@ -29,6 +29,7 @@ use tokio::task::JoinHandle;
 
 pub mod dns;
 pub mod gateway;
+pub mod iface;
 pub mod scheduler;
 pub mod wifi;
 

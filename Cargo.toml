@@ -51,6 +51,12 @@ socket2 = { version = "0.5", features = ["all"] }
 # Property-list parsing (system_profiler -xml SPAirPortDataType output)
 plist = "1.7"
 
+# Per-interface counters (rx/tx bytes / packets / errors). Safe wrapper
+# around platform APIs (getifaddrs+if_data on macOS, /proc/net/dev on
+# Linux). We disable defaults to avoid pulling in the system-wide
+# probes — only the `Networks` plane is used.
+sysinfo = { version = "0.32", default-features = false, features = ["network"] }
+
 # Utility
 parking_lot = "0.12"
 once_cell = "1"

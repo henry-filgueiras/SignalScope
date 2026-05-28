@@ -33,6 +33,7 @@ mod windows;
 
 pub use lifecycle::LifecycleConfig;
 pub use rules::{pressure_tier, PressureTier};
+pub use windows::{InterfaceThroughputWindow, Throughput};
 use lifecycle::LifecycleTracker;
 use windows::{
     DnsWindow, GatewayWindow, RfEnvironmentWindow, WifiSignalWindow, WifiState,
@@ -49,6 +50,12 @@ const WINDOW: Duration = Duration::from_secs(30);
 /// trend windows. Long enough that a 60–120 s lookback inside the rules
 /// has plenty of history to compare halves of.
 const TREND_WINDOW: Duration = Duration::from_secs(300);
+
+/// Throughput is derived as `(latest_counters − earliest_counters) / dt`
+/// over this span. Kept tight on purpose: a 10–15 s rolling rate tracks
+/// what the link is doing *now*; a minute-long window would smear over
+/// the bursty failures the observatory is built to see.
+const THROUGHPUT_WINDOW: Duration = Duration::from_secs(15);
 
 /// Cadence of the safety-net evaluation tick. Driven by a timer rather
 /// than incoming events so resolutions still fire when all sensors are
@@ -85,6 +92,7 @@ impl AnalysisEngine {
         let mut dns = DnsWindow::new(WINDOW);
         let mut signal = WifiSignalWindow::new(TREND_WINDOW);
         let mut env_window = RfEnvironmentWindow::new(TREND_WINDOW);
+        let mut throughput = InterfaceThroughputWindow::new(THROUGHPUT_WINDOW);
         let mut tracker = LifecycleTracker::new(self.lifecycle_config.clone());
 
         let mut tick = tokio::time::interval(LIFECYCLE_TICK);
@@ -103,6 +111,7 @@ impl AnalysisEngine {
                 &mut dns,
                 &mut signal,
                 &mut env_window,
+                &mut throughput,
             );
         }
 
@@ -121,6 +130,7 @@ impl AnalysisEngine {
                         &mut dns,
                         &mut signal,
                         &mut env_window,
+                        &mut throughput,
                     );
 
                     if let Some(roam) = wifi.take_pending_roam() {
@@ -183,6 +193,7 @@ fn ingest(
     dns: &mut DnsWindow,
     signal: &mut WifiSignalWindow,
     env: &mut RfEnvironmentWindow,
+    throughput: &mut InterfaceThroughputWindow,
 ) {
     match event {
         Event::Wifi(obs) => {
@@ -195,6 +206,7 @@ fn ingest(
         }
         Event::GatewayLatency(o) => gateway.record(o),
         Event::DnsLatency(o) => dns.record(o),
+        Event::InterfaceCounters(o) => throughput.record(o, at),
         Event::SensorHealth(h) => {
             // Forget the connected-link trend when Wi-Fi acquisition stops
             // — otherwise associated_duration keeps ticking against a
@@ -208,6 +220,20 @@ fn ingest(
                 )
             {
                 signal.forget();
+            }
+            // Likewise drop throughput state if the interface sensor says
+            // the primary interface is gone — the next sample would
+            // otherwise be compared against a counter snapshot from a
+            // different uptime.
+            if h.sensor.as_str() == "iface"
+                && matches!(
+                    h.state,
+                    SensorState::Stale
+                        | SensorState::BackendUnavailable
+                        | SensorState::HardwareDisabled
+                )
+            {
+                throughput.forget();
             }
         }
         Event::InterfaceStateChanged(_)

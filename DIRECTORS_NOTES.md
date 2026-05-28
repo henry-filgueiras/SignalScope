@@ -27,7 +27,8 @@ A Cargo workspace with five crates:
 - `signalscope-sensors` — `Sensor` trait + per-source adapters. Currently:
   Wi-Fi (macOS, primary backend `system_profiler -xml SPAirPortDataType`,
   legacy `airport` retained as a fallback for pre-Sonoma hosts), gateway
-  (`ping`), DNS (`hickory-resolver`).
+  (`ping`), DNS (`hickory-resolver`), interface counters (`sysinfo`
+  wrapper around `getifaddrs`+`if_data` / `/proc/net/dev`).
 - `signalscope-analysis` — rolling windows over the event stream + a
   handful of confidence-scored correlation rules.
 - `signalscope-tui` — ratatui dashboard, binary `signalscope`.
@@ -209,13 +210,56 @@ Arg parsing is hand-rolled; no `clap` dependency. The intent is
 non-technical collection and portable diagnostics, not a daemon
 platform.
 
+### Interface counters & throughput
+
+A fourth sensor (`iface`) follows the default-route interface and
+publishes [`InterfaceCountersObservation`] every 2 s — cumulative
+`rx/tx_bytes_total`, `rx/tx_packets_total`, `rx/tx_errors_total`. The
+backend is the `sysinfo` crate (default features stripped, only the
+`network` plane enabled), which wraps `getifaddrs(3)` + `if_data`
+on macOS and `/proc/net/dev` on Linux without forcing us to drop
+`#![forbid(unsafe_code)]`. No `ifconfig` / `netstat` shelling out.
+
+`rx/tx_dropped_total` and `retry_count` are `Option<u64>` in the
+event model and left `None` from this backend by design. Modern
+userspace counter surfaces don't expose them; richer integrations
+(Linux nl80211 station stats, monitor-mode capture, future platform
+work) can populate them later without an event-model migration.
+
+Throughput is derived in `signalscope-analysis::InterfaceThroughputWindow`
+as `(latest_counters − earliest_counters_in_window) / dt` over a
+15 s rolling span. Deliberately no extra smoothing — over-smoothing
+would smear the bursty failures the observatory is built to make
+visible. The window resets on interface name change *and* on any
+non-monotonic counter (interface reset, driver reload, sysinfo
+rebaseline), so derivations never compare apples to oranges. The
+analysis engine also forgets throughput state when the iface sensor
+reports a `Stale` / `BackendUnavailable` / `HardwareDisabled` health
+edge.
+
+The TUI shares the same `InterfaceThroughputWindow` for its visual
+derivation, so the dashboard and any future throughput rules
+necessarily agree on what "now" means.
+
+### Findings hook for path throughput
+
+No throughput-related `FindingKind` variants exist yet — per
+deliberate scope. `InterfaceThroughputWindow` is the *data hook*:
+the rolling state needed to author rules like "throughput collapse",
+"sustained inactivity under known link load", "throughput recovery",
+"bufferbloat-suspicious latency under load" lives in the analysis
+crate and ticks against every counter envelope. Adding a rule means
+writing a stateless `rules::*` function over the existing window —
+no further plumbing.
+
 ### Phase 1 scope
 
-In: Wi-Fi link + scan, gateway probe, DNS probe, lightweight
-correlation, TUI dashboard, append-only JSONL session recording with
-a minimal replay-read path.
+In: Wi-Fi link + scan, gateway probe, DNS probe, interface counters
++ throughput derivation, lightweight correlation, TUI dashboard,
+append-only JSONL session recording with a minimal replay-read path.
 Out: packet capture, monitor mode, offensive tooling, replay UI,
-timeline scrubbers, web UI, plugin system.
+timeline scrubbers, web UI, plugin system, speed tests, bandwidth
+benchmarks.
 
 ### Platform stance
 
@@ -249,6 +293,125 @@ The TUI owns the terminal, so logs go to a rotating file under
 ---
 
 ## Resolved Dragons and Pivots
+
+### 2026-05-28 — Claude Opus 4.7 (interface counters + throughput)
+
+**Demoted from Canon, verbatim:**
+
+> - `signalscope-sensors` — `Sensor` trait + per-source adapters. Currently:
+>   Wi-Fi (macOS, primary backend `system_profiler -xml SPAirPortDataType`,
+>   legacy `airport` retained as a fallback for pre-Sonoma hosts), gateway
+>   (`ping`), DNS (`hickory-resolver`).
+
+> ### Phase 1 scope
+>
+> In: Wi-Fi link + scan, gateway probe, DNS probe, lightweight
+> correlation, TUI dashboard, append-only JSONL session recording with
+> a minimal replay-read path.
+> Out: packet capture, monitor mode, offensive tooling, replay UI,
+> timeline scrubbers, web UI, plugin system.
+
+**Goal.** Add a fourth observational plane — path throughput and
+interface health — without dragging in packet capture or platform
+archaeology. Strengthens "what is the network actually doing right
+now?" while staying inside the observatory aesthetic.
+
+**Event model.** New `InterfaceCountersObservation` with cumulative
+`rx/tx_bytes_total`, `rx/tx_packets_total`, `rx/tx_errors_total` as
+required fields. `rx/tx_dropped_total` and `retry_count` are
+`Option<u64>` so richer backends (Linux nl80211, monitor mode) can
+populate them later without an event-model migration. `Event::
+InterfaceCounters(...)` joins the union; `EventCategory::Interface`
+now covers state changes *and* counter snapshots.
+
+**Sensor.** New `iface` sensor using the `sysinfo` crate (default
+features off, only `network`). That gives us `getifaddrs`/`if_data`
+on macOS and `/proc/net/dev` on Linux as safe APIs — keeps the
+`#![forbid(unsafe_code)]` invariant intact across the workspace. No
+shelling out to `ifconfig` or `netstat`. The sensor follows the
+default-route interface (reuses the gateway sensor's `route` lookup),
+re-discovers every 30 s so DHCP renewals / Wi-Fi↔Ethernet handoffs
+don't strand it, and emits a `Stale` health edge when no default
+route exists. Cadence is 2 s — chosen to be fine-grained enough that
+the 15-s throughput window has plenty of samples, coarse enough that
+the recorder file doesn't bloat under capture.
+
+**Analysis.** New `InterfaceThroughputWindow` in `windows.rs` stores
+successive counter snapshots and exposes `throughput_bps()` returning
+a `Throughput { rx_bps, tx_bps, sample_span }`. Two reset paths:
+
+- Interface name change wipes the buffer — `en0` counters and `en7`
+  counters live in unrelated number spaces.
+- Any non-monotonic byte total wipes the buffer — interface resets,
+  driver reloads, sysinfo rebaselines all manifest as cumulative
+  going backwards, and a derived rate over that boundary would be
+  nonsense.
+
+The engine ingests `InterfaceCounters` into the window and also
+calls `forget()` when the iface sensor publishes a `Stale` /
+`BackendUnavailable` / `HardwareDisabled` health edge.
+
+No throughput-related `FindingKind` variants yet — per scope. The
+window *is* the future-findings hook: throughput collapse, sustained
+inactivity under known link load, throughput recovery, and bufferbloat
+indicators can be authored as `rules::*` functions over it whenever
+the project wants them.
+
+**TUI.** The Connected-link card gained one new row:
+`RX/TX 28.4 Mbps / 3.1 Mbps    errs 0/0`. Rate uses `fmt_rate` —
+fixed-precision per magnitude (Kbps / Mbps / Gbps) so the column
+doesn't jitter on sample-to-sample fluctuation, with `idle` for
+literal zero. Color-graded by peak rate: dim under 50 Kbps,
+informational under 5 Mbps, OK above. Errors light up in `WARN_FG`
+the moment they become nonzero — this is the first knob that should
+correlate with `gateway loss` / `dns failure` clusters once those
+findings can read it. Connected-link card grew from 11 to 12 rows
+to make space.
+
+The event feed gained an `iface en0 rx=… tx=… err=…/…` row using a
+binary-suffix humaniser so cumulative GB totals don't blow up the
+column width.
+
+Both `observe` and `capture` modes register the new sensor; the
+capture status line grew an `iface=N` bucket.
+
+**Tests.** New `signalscope-analysis` tests:
+
+- `throughput_window_returns_none_until_one_second_spans` —
+  derivation refuses to fire with a single sample.
+- `throughput_window_derives_bps_from_byte_delta` — math sanity:
+  100 KB/s = 800 Kbps, 10 KB/s = 80 Kbps.
+- `throughput_window_resets_on_interface_swap` — name change wipes
+  the buffer.
+- `throughput_window_resets_on_counter_decrease` — non-monotonic
+  counters wipe the buffer.
+- `throughput_window_evicts_old_samples_but_keeps_minimum_two` —
+  span eviction still leaves enough history to derive a rate, and
+  the rate stays stable across eviction.
+
+New `signalscope-sensors` tests pin the route-output parsers:
+`macos_route_extracts_interface_field`, `linux_route_extracts_dev_token`,
+`linux_route_handles_missing_default`.
+
+`cargo test --workspace`: 49/49 green (up from 41).
+
+**Smoke.** `signalscope capture --output /tmp/iface-smoke.session`
+for 7 s on this host emitted 3 counter envelopes for `en0`,
+operational health edge, real cumulative byte totals (rx=3.6 GB,
+tx=3.2 GB since boot), and the inline `iface=N` status counter
+ticked.
+
+**What this buys.** The observatory now sees the *traffic* on the
+path, not just the path's RTT. The next operational story it can
+help tell — "DNS failures are clustered around throughput collapse
+on en0" or "gateway p95 stayed flat across a 30 Mbps→idle drop" —
+becomes authorable as a small set of new rules over windows that
+already exist.
+
+**Untouched.** Bus shape, lifecycle pipeline, gateway/DNS/Wi-Fi
+sensors, observation confidence, macOS backend layering, trend
+rules, RF occupancy panel, finding fingerprints, session-recording
+format. The change is purely additive at every layer.
 
 ### 2026-05-28 — Claude Opus 4.7 (session recording + capture mode)
 

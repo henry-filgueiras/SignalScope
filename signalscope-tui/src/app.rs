@@ -17,11 +17,12 @@ use crossterm::terminal::{
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use signalscope_analysis::{InterfaceThroughputWindow, Throughput};
 use signalscope_core::EventBus;
 use signalscope_events::{
     Bssid, CorrelationFinding, DnsLatencyObservation, Envelope, Event, FindingLifecycle,
-    GatewayLatencyObservation, ScanResult, SensorHealth, SensorId, SensorState, Ssid,
-    WifiObservation,
+    GatewayLatencyObservation, InterfaceCountersObservation, ScanResult, SensorHealth, SensorId,
+    SensorState, Ssid, WifiObservation,
 };
 use tokio::time::interval;
 use tracing::warn;
@@ -32,6 +33,10 @@ const GATEWAY_HISTORY: usize = 240;
 const DNS_HISTORY: usize = 240;
 const EVENT_FEED_LIMIT: usize = 200;
 const SIGNAL_HISTORY: usize = 90;
+/// Throughput is derived from successive counter snapshots. Mirrors the
+/// analysis crate's `THROUGHPUT_WINDOW` so the dashboard and the future
+/// finding rules speak about the same rolling rate.
+const THROUGHPUT_WINDOW: Duration = Duration::from_secs(15);
 
 pub async fn run(bus: Arc<EventBus>) -> Result<()> {
     let mut state = AppState::new();
@@ -205,6 +210,13 @@ pub struct AppState {
     /// Rolling RSSI samples for the connected-link sparkline and Δ
     /// callout. Caps at `SIGNAL_HISTORY` entries (~15 min at 10 s cadence).
     pub signal_history: VecDeque<SignalSample>,
+    /// Most recent interface counter snapshot. Kept verbatim so the
+    /// dashboard can show absolute totals next to the derived rate.
+    pub latest_counters: Option<InterfaceCountersObservation>,
+    /// Rolling throughput derivation. Shares the math with the analysis
+    /// crate so future throughput rules and the dashboard agree on what
+    /// "now" means.
+    pub throughput: InterfaceThroughputWindow,
     pub focus: Focus,
     pub show_help: bool,
     /// When true, the RF environment panel renders the neighbor AP table
@@ -227,6 +239,8 @@ impl AppState {
             connected_identity: (None, None),
             connected_since: None,
             signal_history: VecDeque::with_capacity(SIGNAL_HISTORY),
+            latest_counters: None,
+            throughput: InterfaceThroughputWindow::new(THROUGHPUT_WINDOW),
             focus: Focus::Overview,
             show_help: false,
             show_neighbor_detail: false,
@@ -262,6 +276,10 @@ impl AppState {
                     self.findings.insert(f.fingerprint.clone(), f.clone());
                 }
             },
+            Event::InterfaceCounters(o) => {
+                self.throughput.record(o, env.at);
+                self.latest_counters = Some(o.clone());
+            }
             Event::SensorHealth(h) => {
                 if h.sensor.as_str() == "wifi"
                     && matches!(
@@ -274,6 +292,17 @@ impl AppState {
                     self.connected_identity = (None, None);
                     self.connected_since = None;
                     self.signal_history.clear();
+                }
+                if h.sensor.as_str() == "iface"
+                    && matches!(
+                        h.state,
+                        SensorState::Stale
+                            | SensorState::BackendUnavailable
+                            | SensorState::HardwareDisabled
+                    )
+                {
+                    self.throughput.forget();
+                    self.latest_counters = None;
                 }
                 self.sensor_health.insert(h.sensor.clone(), h.clone());
             }
@@ -338,6 +367,13 @@ impl AppState {
     pub fn health_for(&self, sensor: &str) -> Option<&SensorHealth> {
         self.sensor_health
             .get(&SensorId::new(sensor))
+    }
+
+    /// Current derived throughput, if the window has accumulated enough
+    /// samples. Returns `None` until at least two counter snapshots span
+    /// ≥ 1 second.
+    pub fn current_throughput(&self) -> Option<Throughput> {
+        self.throughput.throughput_bps()
     }
 
     fn push_feed(&mut self, env: &Envelope) {
@@ -406,6 +442,14 @@ fn format_feed_line(env: &Envelope) -> Option<FeedItem> {
             }
         }
         Event::InterfaceStateChanged(i) => format!("iface  {} {:?}→{:?}", i.interface, i.previous, i.current),
+        Event::InterfaceCounters(o) => format!(
+            "iface  {} rx={} tx={} err={}/{}",
+            o.interface,
+            humanize_bytes(o.rx_bytes_total),
+            humanize_bytes(o.tx_bytes_total),
+            o.rx_errors_total,
+            o.tx_errors_total,
+        ),
         Event::RoamDetected(r) => format!(
             "roam   {} → {} ({} → {})",
             r.from_bssid,
@@ -445,6 +489,27 @@ fn format_feed_line(env: &Envelope) -> Option<FeedItem> {
         category: env.event.category(),
         line,
     })
+}
+
+/// Compact byte total formatting for the event feed. Keeps the column
+/// narrow even when cumulative counters reach the gigabyte range.
+fn humanize_bytes(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * KB;
+    const GB: f64 = 1024.0 * MB;
+    const TB: f64 = 1024.0 * GB;
+    let n = n as f64;
+    if n >= TB {
+        format!("{:.1}T", n / TB)
+    } else if n >= GB {
+        format!("{:.1}G", n / GB)
+    } else if n >= MB {
+        format!("{:.1}M", n / MB)
+    } else if n >= KB {
+        format!("{:.1}K", n / KB)
+    } else {
+        format!("{n}B")
+    }
 }
 
 /// Helper for ui — human-friendly uptime formatting.

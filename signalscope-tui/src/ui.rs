@@ -8,7 +8,7 @@ use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Wrap};
 use ratatui::Frame;
-use signalscope_analysis::{pressure_tier, PressureTier};
+use signalscope_analysis::{pressure_tier, PressureTier, Throughput};
 use signalscope_events::{
     BandClass, CorrelationFinding, DnsLatencyObservation, EventCategory, FindingLifecycle,
     GatewayLatencyObservation, NeighborAp, ObservationConfidence, SensorHealth, SensorState,
@@ -42,7 +42,7 @@ pub fn render(f: &mut Frame, state: &AppState) {
 }
 
 fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
-    let sensors = "wifi · gateway · dns";
+    let sensors = "wifi · gateway · dns · iface";
     let uptime = crate::app::fmt_uptime(state.uptime());
     let line = Line::from(vec![
         Span::styled("SignalScope", theme::title_style()),
@@ -92,12 +92,13 @@ fn render_main(f: &mut Frame, area: Rect, state: &AppState) {
     .split(area);
 
     // Left column: connected link / gateway / dns stack.
-    // The connected-link card gets extra rows because it now hosts the
-    // longitudinal "Connected for / Δ RSSI" line and a small sparkline.
+    // The connected-link card hosts longitudinal RF context (Held / Δ
+    // RSSI / sparkline) and the path-throughput line — one row for
+    // each, plus a small sparkline.
     let left = Layout::new(
         Direction::Vertical,
         [
-            Constraint::Length(11),
+            Constraint::Length(12),
             Constraint::Length(7),
             Constraint::Min(5),
         ],
@@ -257,6 +258,7 @@ fn render_wifi_card(f: &mut Frame, area: Rect, state: &AppState) {
             label("Δ RSSI"),
             Span::styled(delta_text, Style::default().fg(delta_color)),
         ]),
+        throughput_line(state),
     ];
 
     // Split the body area so the text takes most of it and a small
@@ -291,6 +293,77 @@ fn render_wifi_card(f: &mut Frame, area: Rect, state: &AppState) {
 fn rssi_to_sparkline_height(rssi_dbm: i32) -> u64 {
     let clamped = rssi_dbm.clamp(-90, -30);
     (clamped + 90) as u64
+}
+
+/// Compact path-throughput line for the connected-link card. Shows
+/// derived RX/TX rate and cumulative error counts side by side. When
+/// the derivation isn't ready yet (one or zero samples) renders a
+/// placeholder rather than a confidently wrong zero.
+fn throughput_line<'a>(state: &'a AppState) -> Line<'a> {
+    let mut spans = vec![label("RX/TX")];
+    match state.current_throughput() {
+        Some(t) => {
+            spans.push(Span::styled(
+                format!("{} / {}", fmt_rate(t.rx_bps), fmt_rate(t.tx_bps)),
+                Style::default()
+                    .fg(throughput_color(&t))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        None => {
+            spans.push(Span::styled("—  /  —", theme::dim()));
+        }
+    }
+    spans.push(Span::raw("    "));
+    spans.push(label("errs"));
+    match state.latest_counters.as_ref() {
+        Some(c) => {
+            let errs = c.rx_errors_total + c.tx_errors_total;
+            let color = if errs == 0 {
+                theme::DIM_FG
+            } else {
+                theme::WARN_FG
+            };
+            spans.push(Span::styled(
+                format!("{}/{}", c.rx_errors_total, c.tx_errors_total),
+                Style::default().fg(color),
+            ));
+        }
+        None => spans.push(Span::styled("—/—", theme::dim())),
+    }
+    Line::from(spans)
+}
+
+/// Format a bits-per-second rate with a tight unit. Stays inside one
+/// alignment cell up to multi-gigabit links; uses fixed precision per
+/// magnitude so the column doesn't jitter sample-to-sample.
+fn fmt_rate(bps: f64) -> String {
+    if bps >= 1.0e9 {
+        format!("{:.2} Gbps", bps / 1.0e9)
+    } else if bps >= 1.0e6 {
+        format!("{:.1} Mbps", bps / 1.0e6)
+    } else if bps >= 1.0e3 {
+        format!("{:.0} Kbps", bps / 1.0e3)
+    } else if bps > 0.0 {
+        format!("{:.0} bps", bps)
+    } else {
+        "idle".to_string()
+    }
+}
+
+/// Color-grade the larger of RX/TX. Idle and trickle traffic stay calm
+/// (dim); steady use is neutral; sustained high rates light up green to
+/// signal an actively healthy path. This is intentionally permissive —
+/// throughput findings can take over judgemental coloring later.
+fn throughput_color(t: &Throughput) -> ratatui::style::Color {
+    let peak = t.rx_bps.max(t.tx_bps);
+    if peak < 50_000.0 {
+        theme::DIM_FG
+    } else if peak < 5_000_000.0 {
+        theme::INFO_FG
+    } else {
+        theme::OK_FG
+    }
 }
 
 fn wifi_card_title(health: Option<&SensorHealth>) -> String {
