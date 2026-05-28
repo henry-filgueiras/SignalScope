@@ -19,8 +19,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use signalscope_core::EventBus;
 use signalscope_events::{
-    CorrelationFinding, DnsLatencyObservation, Envelope, Event, FindingLifecycle,
-    GatewayLatencyObservation, ScanResult, SensorHealth, SensorId, WifiObservation,
+    Bssid, CorrelationFinding, DnsLatencyObservation, Envelope, Event, FindingLifecycle,
+    GatewayLatencyObservation, ScanResult, SensorHealth, SensorId, SensorState, Ssid,
+    WifiObservation,
 };
 use tokio::time::interval;
 use tracing::warn;
@@ -30,6 +31,7 @@ use crate::ui;
 const GATEWAY_HISTORY: usize = 240;
 const DNS_HISTORY: usize = 240;
 const EVENT_FEED_LIMIT: usize = 200;
+const SIGNAL_HISTORY: usize = 90;
 
 pub async fn run(bus: Arc<EventBus>) -> Result<()> {
     let mut state = AppState::new();
@@ -166,6 +168,16 @@ impl Focus {
     }
 }
 
+/// A single connected-link RSSI reading retained for the local sparkline
+/// and for the "Δ over 60s" callout. Kept in the TUI rather than read
+/// back from the analysis crate to keep concerns separate — the engine's
+/// trend windows feed the findings panel; this buffer feeds the visual.
+#[derive(Debug, Clone)]
+pub struct SignalSample {
+    pub at: time::OffsetDateTime,
+    pub rssi_dbm: i32,
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub started_at: Instant,
@@ -179,6 +191,17 @@ pub struct AppState {
     pub findings: HashMap<String, CorrelationFinding>,
     pub sensor_health: HashMap<SensorId, SensorHealth>,
     pub event_feed: VecDeque<FeedItem>,
+    /// Identity of the currently-associated network (SSID, BSSID). Used
+    /// to detect identity changes that should reset the longitudinal
+    /// "connected for" counter.
+    pub connected_identity: (Option<Ssid>, Option<Bssid>),
+    /// Wall-clock time we first observed the current association. Reset
+    /// when the identity changes; cleared when the sensor reports that
+    /// Wi-Fi is off / unavailable.
+    pub connected_since: Option<time::OffsetDateTime>,
+    /// Rolling RSSI samples for the connected-link sparkline and Δ
+    /// callout. Caps at `SIGNAL_HISTORY` entries (~15 min at 10 s cadence).
+    pub signal_history: VecDeque<SignalSample>,
     pub focus: Focus,
     pub show_help: bool,
 }
@@ -194,6 +217,9 @@ impl AppState {
             findings: HashMap::new(),
             sensor_health: HashMap::new(),
             event_feed: VecDeque::with_capacity(EVENT_FEED_LIMIT),
+            connected_identity: (None, None),
+            connected_since: None,
+            signal_history: VecDeque::with_capacity(SIGNAL_HISTORY),
             focus: Focus::Overview,
             show_help: false,
         }
@@ -202,6 +228,7 @@ impl AppState {
     pub fn ingest(&mut self, env: &Envelope) {
         match &env.event {
             Event::Wifi(o) => {
+                self.record_link_longitudinal(o, env.at);
                 self.latest_wifi = Some(o.clone());
             }
             Event::Scan(s) => {
@@ -228,12 +255,75 @@ impl AppState {
                 }
             },
             Event::SensorHealth(h) => {
+                if h.sensor.as_str() == "wifi"
+                    && matches!(
+                        h.state,
+                        SensorState::HardwareDisabled
+                            | SensorState::BackendUnavailable
+                            | SensorState::PermissionDenied
+                    )
+                {
+                    self.connected_identity = (None, None);
+                    self.connected_since = None;
+                    self.signal_history.clear();
+                }
                 self.sensor_health.insert(h.sensor.clone(), h.clone());
             }
             Event::InterfaceStateChanged(_) | Event::RoamDetected(_) => {}
         }
 
         self.push_feed(env);
+    }
+
+    fn record_link_longitudinal(&mut self, obs: &WifiObservation, at: time::OffsetDateTime) {
+        let new_identity = (obs.ssid.clone(), obs.bssid.clone());
+        if self.connected_identity != new_identity || self.connected_since.is_none() {
+            self.connected_identity = new_identity;
+            self.connected_since = Some(at);
+            self.signal_history.clear();
+        }
+        if let Some(rssi) = obs.rssi_dbm {
+            if self.signal_history.len() == SIGNAL_HISTORY {
+                self.signal_history.pop_front();
+            }
+            self.signal_history.push_back(SignalSample { at, rssi_dbm: rssi });
+        }
+    }
+
+    /// Wall-clock duration since the current association was first
+    /// observed. `None` when not associated.
+    pub fn connected_duration(&self) -> Option<Duration> {
+        let since = self.connected_since?;
+        let now = time::OffsetDateTime::now_utc();
+        let secs = (now - since).whole_seconds().max(0);
+        Some(Duration::from_secs(secs as u64))
+    }
+
+    /// Difference of mean RSSI between the recent and prior halves of
+    /// `lookback`. Returns `None` if either half has fewer than 2
+    /// samples — we don't want to claim a trend from a single reading.
+    pub fn rssi_delta_over(&self, lookback: Duration) -> Option<f64> {
+        let now = time::OffsetDateTime::now_utc();
+        let half = lookback.as_secs() as i64 / 2;
+        let recent_start = now - time::Duration::seconds(half);
+        let prior_start = now - time::Duration::seconds(lookback.as_secs() as i64);
+        let mut recent_sum = 0i64;
+        let mut recent_n = 0i64;
+        let mut prior_sum = 0i64;
+        let mut prior_n = 0i64;
+        for s in &self.signal_history {
+            if s.at >= recent_start {
+                recent_sum += s.rssi_dbm as i64;
+                recent_n += 1;
+            } else if s.at >= prior_start {
+                prior_sum += s.rssi_dbm as i64;
+                prior_n += 1;
+            }
+        }
+        if recent_n < 2 || prior_n < 2 {
+            return None;
+        }
+        Some(recent_sum as f64 / recent_n as f64 - prior_sum as f64 / prior_n as f64)
     }
 
     /// Lookup current health for a sensor by id (e.g. `"wifi"`).

@@ -151,13 +151,22 @@ pub enum FindingLifecycle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FindingKind {
+    // — RF environment / ambient —
     RfCongestion,
+    /// Density of ambient APs is changing (rising or falling). Direction
+    /// is encoded in the finding's fingerprint.
+    RfDensityTrend,
+
+    // — Connected link / station state —
     ApOverload,
     GatewayInstability,
     WanCongestion,
     DnsPathology,
     RoamingInstability,
     StickyClient,
+    /// Connected-link signal quality is drifting up or down over time.
+    /// Direction is encoded in the finding's fingerprint.
+    SignalTrend,
 }
 
 /// A sensor reporting on its own operational state. Use this to communicate

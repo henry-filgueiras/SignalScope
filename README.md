@@ -19,10 +19,13 @@ architectural goal — see [`docs/architecture.md`](docs/architecture.md) and
 
 ## What works today
 
-- live Wi-Fi link card (SSID, BSSID, RSSI, noise, SNR, channel, PHY mode)
-  driven by `system_profiler -xml SPAirPortDataType` on macOS, with a
-  legacy `airport` fallback
-- neighbor AP list with band, channel, and 6 GHz / Wi-Fi 6E support
+- live **connected-link** card (SSID, BSSID, RSSI, noise, SNR, channel,
+  PHY mode) driven by `system_profiler -xml SPAirPortDataType` on macOS,
+  with a legacy `airport` fallback. Includes a longitudinal "held for"
+  duration, a 60 s Δ RSSI callout, and a recent-RSSI sparkline.
+- **RF environment** panel with busiest-channel summary, density trend
+  indicator, and the visible neighbor list (band, channel, 6 GHz /
+  Wi-Fi 6E support)
 - sensor-health surface — when Wi-Fi is off, redacted, or a backend is
   missing, the card shows the actual state instead of going silent
 - per-observation confidence tags (`Direct` / `Inferred` / `Estimated`
@@ -30,7 +33,9 @@ architectural goal — see [`docs/architecture.md`](docs/architecture.md) and
   "we inferred this" from "we used to know this"
 - gateway latency probe + rolling sparkline
 - DNS latency probe + rolling sparkline
-- lightweight correlation rules with confidence + evidence
+- lightweight correlation rules with confidence + evidence, including
+  longitudinal trend findings (`SignalTrend` for connected-link RSSI
+  drift; `RfDensityTrend` for ambient AP-count change)
 - lifecycle-aware findings (Active / Escalating / Recovering / Resolved)
   — the dashboard reacts to *transitions*, not every poll, so the feed
   stays calm even when a condition holds for minutes

@@ -92,6 +92,50 @@ We do not pretend to know ground truth. We do not run statistical models.
 We do not invoke an LLM. The rules are hand-tuned heuristics that explain
 themselves. Better rules will replace them.
 
+## Connected link vs RF environment
+
+SignalScope reasons about Wi-Fi at two distinct conceptual layers, and
+the UI is shaped to mirror them:
+
+- **Connected link** — the currently associated network as a
+  longitudinal entity. RSSI, SNR, channel, PHY mode, and a "held for X"
+  duration that resets when the (SSID, BSSID) identity changes. This is
+  *my current lifeline*. Anything that disturbs it directly affects the
+  operator. The card includes a small recent-RSSI sparkline and a
+  Δ-over-60s callout for at-a-glance trend awareness.
+- **RF environment** — ambient AP activity around the host. Sparse,
+  probabilistic, frequently redacted on modern macOS. This is *the
+  weather*. The panel summarises density and busiest channel and shows
+  a calm trend indicator (`density rising` / `falling` / `stable`)
+  driven by the current `RfDensityTrend` finding state.
+
+That conceptual split also lives in `signalscope-analysis`. Two new
+windows in `analysis/windows.rs`:
+
+- `WifiSignalWindow` records RSSI tied to an association identity. The
+  window resets when the identity changes — a different connection has
+  its own clock. Methods:
+    * `associated_duration(now)` — wall-clock time since first sample,
+    * `rssi_delta(lookback, now)` — recent-half minus prior-half mean
+      RSSI; `None` until each half has ≥2 samples.
+- `RfEnvironmentWindow` records `(timestamp, ap_count)` per scan and
+  exposes `density_delta(lookback, now)` with the same recent/prior
+  halving.
+
+Two new rules consume those windows:
+
+- `signal_trend` — RSSI Δ over 90 s, threshold ±5 dB. Fingerprint
+  encodes direction (`signal_trend:<key>:degrading` vs `:recovering`)
+  so a degradation that flips to a recovery resolves cleanly under the
+  lifecycle pipeline instead of mutating the same entry.
+- `rf_density_trend` — AP-count Δ over 120 s, threshold ±3 APs. Same
+  direction-as-fingerprint pattern (`rf_density_trend:rising` vs
+  `:falling`).
+
+Both inherit the lifecycle suppression and the periodic 2 s safety-net
+tick, so "stabilising" is automatically expressed as the Resolved edge
+of a previously-active trend.
+
 ## Findings are transitions, not heartbeats
 
 A printf-loop dashboard re-emits "RF congestion!" every poll for as long

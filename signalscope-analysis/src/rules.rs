@@ -11,9 +11,27 @@
 //! the same fingerprint refer to the same thing, even if other fields
 //! drift.
 
-use signalscope_events::FindingKind;
+use std::time::Duration;
 
-use crate::windows::{DnsWindow, GatewayWindow, WifiState};
+use signalscope_events::FindingKind;
+use time::OffsetDateTime;
+
+use crate::windows::{DnsWindow, GatewayWindow, RfEnvironmentWindow, WifiSignalWindow, WifiState};
+
+/// Lookback window for the connected-link signal trend. Long enough to
+/// average out per-sample noise, short enough to feel responsive.
+const SIGNAL_LOOKBACK: Duration = Duration::from_secs(90);
+
+/// Lookback window for the RF density trend. Scans run at ~10 s cadence,
+/// so this gives us roughly 12 samples to compare halves of.
+const DENSITY_LOOKBACK: Duration = Duration::from_secs(120);
+
+/// Minimum RSSI delta (dB) that counts as a real trend rather than
+/// per-sample wobble.
+const SIGNAL_TREND_DB: f64 = 5.0;
+
+/// Minimum AP-count delta that counts as a real density shift.
+const DENSITY_TREND_APS: f64 = 3.0;
 
 /// A finding as produced by a rule, before the lifecycle layer has
 /// decided what (if anything) to publish.
@@ -31,6 +49,9 @@ pub fn evaluate(
     wifi: &WifiState,
     gateway: &GatewayWindow,
     dns: &DnsWindow,
+    signal: &WifiSignalWindow,
+    env: &RfEnvironmentWindow,
+    now: OffsetDateTime,
 ) -> Vec<CandidateFinding> {
     let mut out = Vec::new();
     if let Some(f) = rf_congestion(wifi) {
@@ -43,6 +64,12 @@ pub fn evaluate(
         out.push(f);
     }
     if let Some(f) = sticky_client(wifi) {
+        out.push(f);
+    }
+    if let Some(f) = signal_trend(signal, now) {
+        out.push(f);
+    }
+    if let Some(f) = rf_density_trend(env, now) {
         out.push(f);
     }
     out
@@ -207,4 +234,94 @@ fn sticky_client(wifi: &WifiState) -> Option<CandidateFinding> {
             format!("Delta: {delta} dB"),
         ],
     })
+}
+
+/// Connected-link signal-quality trend. Positive delta = improving.
+/// Direction is encoded in the fingerprint so a degradation that flips
+/// to a recovery doesn't quietly mutate the same lifecycle entry — it
+/// resolves cleanly and a new finding takes its place.
+fn signal_trend(signal: &WifiSignalWindow, now: OffsetDateTime) -> Option<CandidateFinding> {
+    let delta = signal.rssi_delta(SIGNAL_LOOKBACK, now)?;
+    if delta.abs() < SIGNAL_TREND_DB {
+        return None;
+    }
+    let key = signal.identity_key().unwrap_or_else(|| "current".into());
+    let lookback_secs = SIGNAL_LOOKBACK.as_secs();
+
+    let mut evidence = vec![
+        format!("RSSI Δ over {lookback_secs}s: {delta:+.1} dB"),
+        format!("Samples in window: {}", signal.sample_count()),
+    ];
+    if let Some(d) = signal.associated_duration(now) {
+        evidence.push(format!("Connected for: {}s", d.as_secs()));
+    }
+
+    if delta < 0.0 {
+        let magnitude = -delta;
+        let confidence = (magnitude / 15.0).clamp(0.3, 0.85) as f32;
+        Some(CandidateFinding {
+            kind: FindingKind::SignalTrend,
+            fingerprint: format!("signal_trend:{key}:degrading"),
+            headline: format!(
+                "Signal quality deteriorating ({delta:+.0} dB over {lookback_secs}s)"
+            ),
+            confidence,
+            evidence,
+        })
+    } else {
+        let confidence = (delta / 15.0).clamp(0.3, 0.85) as f32;
+        Some(CandidateFinding {
+            kind: FindingKind::SignalTrend,
+            fingerprint: format!("signal_trend:{key}:recovering"),
+            headline: format!(
+                "Signal quality recovering (+{delta:.0} dB over {lookback_secs}s)"
+            ),
+            confidence,
+            evidence,
+        })
+    }
+}
+
+/// RF-environment density trend. The headline frames the *change*, not
+/// the absolute level — "weather is shifting" rather than "it is cloudy."
+fn rf_density_trend(env: &RfEnvironmentWindow, now: OffsetDateTime) -> Option<CandidateFinding> {
+    let delta = env.density_delta(DENSITY_LOOKBACK, now)?;
+    if delta.abs() < DENSITY_TREND_APS {
+        return None;
+    }
+    let lookback_secs = DENSITY_LOOKBACK.as_secs();
+    let current = env.latest().map(|s| s.ap_count).unwrap_or(0);
+
+    if delta > 0.0 {
+        let confidence = (delta / 10.0).clamp(0.3, 0.8) as f32;
+        Some(CandidateFinding {
+            kind: FindingKind::RfDensityTrend,
+            fingerprint: "rf_density_trend:rising".into(),
+            headline: format!(
+                "Ambient RF density rising (+{delta:.0} APs over {lookback_secs}s, now {current})"
+            ),
+            confidence,
+            evidence: vec![
+                format!("Mean AP-count Δ: {delta:+.1}"),
+                format!("Current AP count: {current}"),
+                format!("Scan samples in window: {}", env.sample_count()),
+            ],
+        })
+    } else {
+        let magnitude = -delta;
+        let confidence = (magnitude / 10.0).clamp(0.3, 0.8) as f32;
+        Some(CandidateFinding {
+            kind: FindingKind::RfDensityTrend,
+            fingerprint: "rf_density_trend:falling".into(),
+            headline: format!(
+                "Ambient RF density falling ({delta:+.0} APs over {lookback_secs}s, now {current})"
+            ),
+            confidence,
+            evidence: vec![
+                format!("Mean AP-count Δ: {delta:+.1}"),
+                format!("Current AP count: {current}"),
+                format!("Scan samples in window: {}", env.sample_count()),
+            ],
+        })
+    }
 }

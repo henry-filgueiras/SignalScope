@@ -11,7 +11,6 @@ use ratatui::Frame;
 use signalscope_events::{
     CorrelationFinding, DnsLatencyObservation, EventCategory, FindingLifecycle,
     GatewayLatencyObservation, NeighborAp, ObservationConfidence, SensorHealth, SensorState,
-    WifiObservation,
 };
 
 use crate::app::{AppState, FeedItem};
@@ -82,11 +81,13 @@ fn render_main(f: &mut Frame, area: Rect, state: &AppState) {
     )
     .split(area);
 
-    // Left column: link / gateway / dns stack
+    // Left column: connected link / gateway / dns stack.
+    // The connected-link card gets extra rows because it now hosts the
+    // longitudinal "Connected for / Δ RSSI" line and a small sparkline.
     let left = Layout::new(
         Direction::Vertical,
         [
-            Constraint::Length(9),
+            Constraint::Length(11),
             Constraint::Length(7),
             Constraint::Min(5),
         ],
@@ -96,8 +97,7 @@ fn render_main(f: &mut Frame, area: Rect, state: &AppState) {
     render_wifi_card(
         f,
         left[0],
-        state.latest_wifi.as_ref(),
-        state.health_for("wifi"),
+        state,
     );
     render_gateway_card(f, left[1], state);
     render_dns_card(f, left[2], state);
@@ -109,21 +109,13 @@ fn render_main(f: &mut Frame, area: Rect, state: &AppState) {
     )
     .split(cols[1]);
 
-    render_neighbors(
-        f,
-        right[0],
-        state.latest_scan.as_ref().map(|s| s.neighbors.as_slice()).unwrap_or(&[]),
-        state.latest_wifi.as_ref(),
-    );
+    render_rf_environment(f, right[0], state);
     render_findings(f, right[1], state);
 }
 
-fn render_wifi_card(
-    f: &mut Frame,
-    area: Rect,
-    wifi: Option<&WifiObservation>,
-    health: Option<&SensorHealth>,
-) {
+fn render_wifi_card(f: &mut Frame, area: Rect, state: &AppState) {
+    let wifi = state.latest_wifi.as_ref();
+    let health = state.health_for("wifi");
     let title = wifi_card_title(health);
     let block = card_block(&title);
     let inner = block.inner(area);
@@ -206,6 +198,21 @@ fn render_wifi_card(
     let rssi_goodness_val = w.rssi_dbm.map(rssi_goodness).unwrap_or(0.5);
     let rssi_color = theme::quality_color(rssi_goodness_val);
 
+    // Longitudinal callout: how long this association has held and how
+    // RSSI has drifted across the recent window. Both are computed in
+    // AppState — see `connected_duration` and `rssi_delta_over`.
+    let connected_str = state
+        .connected_duration()
+        .map(|d| humanize_duration(d))
+        .unwrap_or_else(|| "—".into());
+    let delta = state.rssi_delta_over(std::time::Duration::from_secs(60));
+    let (delta_text, delta_color) = match delta {
+        Some(d) if d.abs() < 1.5 => ("stable".to_string(), theme::DIM_FG),
+        Some(d) if d < 0.0 => (format!("{d:+.0} dB / 60s"), theme::BAD_FG),
+        Some(d) => (format!("{d:+.0} dB / 60s"), theme::OK_FG),
+        None => ("…".to_string(), theme::DIM_FG),
+    };
+
     let lines = vec![
         Line::from(vec![
             label("SSID"),
@@ -233,9 +240,47 @@ fn render_wifi_card(
             label("PHY"),
             Span::styled(phy_str, theme::value()),
         ]),
+        Line::from(vec![
+            label("Held"),
+            Span::styled(connected_str, theme::value()),
+            Span::raw("    "),
+            label("Δ RSSI"),
+            Span::styled(delta_text, Style::default().fg(delta_color)),
+        ]),
     ];
 
-    f.render_widget(Paragraph::new(lines), body_area);
+    // Split the body area so the text takes most of it and a small
+    // RSSI sparkline lives at the bottom. If history is empty, skip the
+    // sparkline so the card doesn't show a flat baseline that looks like
+    // a dead reading.
+    if !state.signal_history.is_empty() {
+        let split = Layout::new(
+            Direction::Vertical,
+            [Constraint::Min(lines.len() as u16), Constraint::Length(1)],
+        )
+        .split(body_area);
+        f.render_widget(Paragraph::new(lines), split[0]);
+        let data: Vec<u64> = state
+            .signal_history
+            .iter()
+            .map(|s| rssi_to_sparkline_height(s.rssi_dbm))
+            .collect();
+        let spark = Sparkline::default()
+            .data(&data)
+            .style(Style::default().fg(rssi_color))
+            .bar_set(symbols::bar::NINE_LEVELS);
+        f.render_widget(spark, split[1]);
+    } else {
+        f.render_widget(Paragraph::new(lines), body_area);
+    }
+}
+
+/// Map a raw RSSI (dBm) into the 0..=90 sparkline bar-height range. We
+/// invert because stronger (less negative) RSSI should produce *taller*
+/// bars, and clamp -90..-30 so the visual stays bounded.
+fn rssi_to_sparkline_height(rssi_dbm: i32) -> u64 {
+    let clamped = rssi_dbm.clamp(-90, -30);
+    (clamped + 90) as u64
 }
 
 fn wifi_card_title(health: Option<&SensorHealth>) -> String {
@@ -243,17 +288,17 @@ fn wifi_card_title(health: Option<&SensorHealth>) -> String {
         Some(h) => {
             let backend = h.backend.as_deref().unwrap_or("—");
             match h.state {
-                SensorState::Operational => format!("Wi-Fi link · {backend}"),
-                SensorState::BackendUnavailable => "Wi-Fi link · backend unavailable".to_string(),
-                SensorState::HardwareDisabled => format!("Wi-Fi link · {backend} · off"),
+                SensorState::Operational => format!("Connected link · {backend}"),
+                SensorState::BackendUnavailable => "Connected link · backend unavailable".to_string(),
+                SensorState::HardwareDisabled => format!("Connected link · {backend} · off"),
                 SensorState::PermissionDenied => {
-                    format!("Wi-Fi link · {backend} · permission denied")
+                    format!("Connected link · {backend} · permission denied")
                 }
-                SensorState::ParseFailed => format!("Wi-Fi link · {backend} · parse failed"),
-                SensorState::Stale => format!("Wi-Fi link · {backend} · stale"),
+                SensorState::ParseFailed => format!("Connected link · {backend} · parse failed"),
+                SensorState::Stale => format!("Connected link · {backend} · stale"),
             }
         }
-        None => "Wi-Fi link".to_string(),
+        None => "Connected link".to_string(),
     }
 }
 
@@ -420,15 +465,29 @@ fn render_dns_card(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(spark, layout[1]);
 }
 
-fn render_neighbors(
-    f: &mut Frame,
-    area: Rect,
-    neighbors: &[NeighborAp],
-    current: Option<&WifiObservation>,
-) {
-    let block = card_block(&format!("Nearby APs ({})", neighbors.len()));
+fn render_rf_environment(f: &mut Frame, area: Rect, state: &AppState) {
+    let neighbors = state
+        .latest_scan
+        .as_ref()
+        .map(|s| s.neighbors.as_slice())
+        .unwrap_or(&[]);
+    let current = state.latest_wifi.as_ref();
+
+    let block = card_block(&format!(
+        "RF environment · {} APs visible",
+        neighbors.len()
+    ));
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    let summary = environmental_summary(neighbors, state);
+    let layout = Layout::new(
+        Direction::Vertical,
+        [Constraint::Length(1), Constraint::Min(1)],
+    )
+    .split(inner);
+    f.render_widget(Paragraph::new(summary), layout[0]);
+    let list_area = layout[1];
 
     let mut sorted: Vec<&NeighborAp> = neighbors.iter().collect();
     // Sort by RSSI descending. Entries without an RSSI fall to the bottom —
@@ -444,7 +503,7 @@ fn render_neighbors(
 
     let items: Vec<ListItem> = sorted
         .iter()
-        .take(inner.height as usize)
+        .take(list_area.height as usize)
         .map(|ap| {
             let is_current = ap.bssid.as_ref().zip(current_bssid).map_or(false, |(a, b)| a == b);
             let marker = if is_current { "● " } else { "  " };
@@ -487,7 +546,43 @@ fn render_neighbors(
         })
         .collect();
 
-    f.render_widget(List::new(items), inner);
+    f.render_widget(List::new(items), list_area);
+}
+
+/// One-line "ambient weather report" for the RF environment card.
+/// Surfaces busiest channel and the current density trend (from the
+/// analysis layer's findings, so we agree with the Findings panel on
+/// what's happening rather than computing a parallel verdict).
+fn environmental_summary<'a>(
+    neighbors: &[NeighborAp],
+    state: &'a AppState,
+) -> Line<'a> {
+    let mut per_channel: std::collections::HashMap<u16, usize> =
+        std::collections::HashMap::new();
+    for ap in neighbors {
+        if let Some(ch) = ap.channel {
+            *per_channel.entry(ch.number).or_insert(0) += 1;
+        }
+    }
+    let busiest = per_channel
+        .iter()
+        .max_by_key(|(_, n)| **n)
+        .map(|(ch, n)| format!("busiest ch{ch} ({n} APs)"))
+        .unwrap_or_else(|| "no channel data".into());
+
+    let rising = state.findings.contains_key("rf_density_trend:rising");
+    let falling = state.findings.contains_key("rf_density_trend:falling");
+    let (trend, trend_color) = match (rising, falling) {
+        (true, _) => ("density rising", theme::WARN_FG),
+        (_, true) => ("density falling", theme::INFO_FG),
+        _ => ("density stable", theme::DIM_FG),
+    };
+
+    Line::from(vec![
+        Span::styled(busiest, theme::value()),
+        Span::styled("   ", theme::dim()),
+        Span::styled(trend, Style::default().fg(trend_color)),
+    ])
 }
 
 fn render_findings(f: &mut Frame, area: Rect, state: &AppState) {

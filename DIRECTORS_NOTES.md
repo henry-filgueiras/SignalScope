@@ -97,6 +97,38 @@ the backend, banner shows the state when not `Operational`). Health
 events are deliberately *not* synthesized observations — a missing
 sensor stays silent on the data plane and loud on the health plane.
 
+### Connected link vs RF environment
+
+SignalScope distinguishes two conceptual layers and the UI mirrors them:
+
+- **Connected link** — the currently associated network as a
+  longitudinal entity (RSSI, SNR, channel, PHY mode, "held for X"
+  duration, recent-RSSI sparkline, Δ-over-60s callout). The TUI tracks
+  `connected_identity = (Option<Ssid>, Option<Bssid>)`,
+  `connected_since`, and a rolling `signal_history` ring; identity
+  changes reset the duration counter.
+- **RF environment** — ambient AP density treated as sparse and
+  probabilistic. The TUI panel summarises busiest channel and shows a
+  density trend indicator (`density rising` / `falling` / `stable`)
+  derived from the current `RfDensityTrend` finding.
+
+In `signalscope-analysis`, two rolling windows back the trend rules:
+
+- `WifiSignalWindow` records RSSI tied to an `(Option<Ssid>,
+  Option<Bssid>)` identity and resets on identity change. Exposes
+  `associated_duration(now)` and `rssi_delta(lookback, now)`.
+- `RfEnvironmentWindow` records `(timestamp, ap_count)` per scan,
+  exposes `density_delta(lookback, now)`.
+
+Two new rules — `signal_trend` (RSSI Δ over 90 s, threshold ±5 dB)
+and `rf_density_trend` (AP-count Δ over 120 s, threshold ±3 APs) —
+ride the existing lifecycle pipeline. Direction lives in the
+fingerprint suffix (`:degrading` vs `:recovering`; `:rising` vs
+`:falling`), so a trend that reverses doesn't quietly mutate the same
+entry — the old direction resolves and the new one goes Active.
+"Stabilising" is naturally expressed as the Resolved edge of a
+previously-active trend.
+
 ### Wi-Fi backend layering (macOS)
 
 Inside `signalscope-sensors/src/wifi/macos/` the sensor picks one
@@ -150,6 +182,75 @@ The TUI owns the terminal, so logs go to a rotating file under
 ---
 
 ## Resolved Dragons and Pivots
+
+### 2026-05-28 — Claude Opus 4.7 (connected link / RF environment split)
+
+**Goal.** Strengthen the semantic distinction between the *current
+lifeline* (the associated network as a longitudinal entity) and the
+*ambient weather* (RF activity around the host). Begin introducing
+trend awareness so the dashboard shifts from "what exists right now?"
+toward "what is changing over time?"
+
+**Event model.** `FindingKind` gained two trend kinds: `SignalTrend`
+(connected-link RSSI drift) and `RfDensityTrend` (ambient AP-count
+shift). Direction lives in the finding's fingerprint suffix.
+
+**Analysis.** Two new rolling windows in `analysis/windows.rs`:
+
+- `WifiSignalWindow` keeps an `(Option<Ssid>, Option<Bssid>)` identity
+  and a rolling RSSI buffer; identity changes wipe the buffer. Exposes
+  `associated_duration(now)` and `rssi_delta(lookback, now)` (recent
+  half mean minus prior half mean, `None` until each half has ≥2
+  samples — we refuse to claim a trend from a single reading).
+- `RfEnvironmentWindow` records `(timestamp, ap_count)` per scan and
+  exposes `density_delta(lookback, now)` with the same recent/prior
+  halving.
+
+Two new stateless rules over those windows:
+
+- `signal_trend` — RSSI Δ over 90 s, threshold ±5 dB.
+- `rf_density_trend` — AP-count Δ over 120 s, threshold ±3 APs.
+
+Both ride the existing lifecycle pipeline, so "stabilising" is the
+Resolved edge of a previously-active trend.
+
+`AnalysisEngine::ingest` was rewritten to thread the envelope's
+wall-clock `at` through to the windows. Seeding from the bus backlog
+now preserves real time positions instead of compressing the whole
+backlog to "now."
+
+The engine also forgets the connected-link signal window when a
+Wi-Fi `SensorHealth` event reports `HardwareDisabled`,
+`BackendUnavailable`, or `PermissionDenied`, so the "Held" counter
+doesn't keep accumulating against a connection we've lost visibility
+into.
+
+**TUI.**
+
+- "Wi-Fi link" → "Connected link" (card title), "Nearby APs" → "RF
+  environment". The semantic split is now legible at a glance.
+- Connected-link card gained a longitudinal line ("Held 12m34s · Δ RSSI
+  -3 dB / 60s") and a one-row recent-RSSI sparkline.
+- RF environment card gained a one-row summary: "busiest ch6 (4 APs)
+  · density stable", where the trend phrase reads off the currently
+  active `RfDensityTrend` finding fingerprint (`rf_density_trend:
+  rising` / `:falling` / absent → `stable`).
+- `AppState` grew `connected_identity`, `connected_since`, and a
+  `signal_history` ring (≤90 samples, ~15 min at 10 s cadence). All
+  reset when the Wi-Fi sensor reports it can no longer see the
+  hardware.
+
+**Tests.** Five new window tests pin the new behaviours:
+`signal_window_resets_on_association_change`,
+`signal_delta_returns_none_until_enough_samples`,
+`signal_delta_detects_drift`, `env_density_delta_detects_rise`,
+`env_density_delta_returns_none_with_too_few_samples`. Workspace
+total 25/25 green.
+
+**What didn't change.** The bus shape, the lifecycle pipeline, the
+gateway/DNS sensors, the sensor health surface, observation confidence,
+the macOS backend layering. The pivot is contained to the analysis
+windows + rules + a TUI rename and one new card row.
 
 ### 2026-05-28 — Claude Opus 4.7 (findings → transitions)
 
