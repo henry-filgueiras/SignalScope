@@ -107,10 +107,15 @@ SignalScope distinguishes two conceptual layers and the UI mirrors them:
   `connected_identity = (Option<Ssid>, Option<Bssid>)`,
   `connected_since`, and a rolling `signal_history` ring; identity
   changes reset the duration counter.
-- **RF environment** — ambient AP density treated as sparse and
-  probabilistic. The TUI panel summarises busiest channel and shows a
-  density trend indicator (`density rising` / `falling` / `stable`)
-  derived from the current `RfDensityTrend` finding.
+- **RF environment** — ambient AP activity treated as sparse and
+  probabilistic. The panel is *anchored on the connected channel*: the
+  header line reads `connected ch44 · pressure: moderate · density
+  stable`, and the primary body is a per-band channel-occupancy
+  histogram with the connected channel marked. The individual-AP table
+  is demoted to a `d`-toggled detail view — modern macOS redacts SSIDs
+  and BSSIDs anyway, so identity rows are low value. Pressure is a
+  four-tier ladder (low / moderate / elevated / severe) computed from
+  the AP count on the connected channel.
 
 In `signalscope-analysis`, two rolling windows back the trend rules:
 
@@ -182,6 +187,83 @@ The TUI owns the terminal, so logs go to a rotating file under
 ---
 
 ## Resolved Dragons and Pivots
+
+### 2026-05-28 — Claude Opus 4.7 (RF environment → occupancy instrument)
+
+**Demoted from Canon, verbatim:**
+
+> - **RF environment** — ambient AP activity around the host. Sparse,
+>   probabilistic, frequently redacted on modern macOS. This is *the
+>   weather*. The panel summarises density and busiest channel and shows
+>   a calm trend indicator (`density rising` / `falling` / `stable`)
+>   driven by the current `RfDensityTrend` finding state.
+
+(The same paragraph in `docs/architecture.md` was likewise replaced
+with the new occupancy-instrument framing.)
+
+**Problem.** Modern macOS routinely redacts SSIDs and omits BSSIDs in
+`SPAirPortDataType`, leaving the AP-row table reading as columns of
+`<redacted>  —  ch6  -67 dBm`. Identity was the wrong organising
+principle. Worse, the panel summary surfaced the *global* busiest
+channel — but the operational question is "how hostile is the airspace
+around *my* connection?", not "which channel is busiest globally?".
+
+**Pivot.**
+
+Analysis:
+
+- `WifiState` gained `current_channel: Option<Channel>` so rules can
+  ask the obvious question: "what channel am I sitting on?"
+- `rf_congestion` rule reshaped to be *local*: counts neighbors only
+  on the connected channel and fires from `Elevated` upward on the
+  new `PressureTier` ladder. Fingerprint becomes
+  `rf_congestion:ch<connected>`, so a roam to a quieter channel
+  resolves the old finding and a roam into a busier one starts a new
+  one — the lifecycle pipeline handles it for free.
+- New `PressureTier { Low, Moderate, Elevated, Severe }` and
+  `pressure_tier(count) -> tier` are re-exported from the analysis
+  crate so the TUI can render the *same* ladder in the panel header
+  without inventing parallel thresholds. Cutoffs (0-2, 3-5, 6-8, 9+)
+  are deliberately coarse — finer gradations would over-claim
+  certainty from sparse scan snapshots.
+- Five new rule tests pin: tier ladder, silence-when-unassociated,
+  silence-when-connected-channel-quiet-but-others-busy, fires-only-
+  from-elevated, fingerprint-follows-connected-channel.
+
+TUI:
+
+- The RF environment panel now leads with a one-line "weather report"
+  anchored on the connected channel
+  (`connected ch44 · pressure: moderate · density stable`). The
+  pressure phrase uses `tier_color()` so the operator gets the
+  severity at a glance.
+- The primary body is a per-band channel-occupancy histogram. Each
+  channel is one row: `  ch44  ██████        6  ← connected`. Bars
+  scale to the busiest channel currently in the scan; the connected
+  channel is highlighted bold and gets the trailing arrow. Bands
+  ordered 2.4 / 5 / 6 GHz; channels ordered ascending within band.
+- The previous AP-row table is preserved but demoted behind a `d`
+  toggle. `AppState::show_neighbor_detail` defaults `false`, the
+  footer surfaces the current mode (`RF: occupancy` /
+  `RF: AP table`), and the help overlay documents the toggle. This
+  keeps identity-oriented inspection available without crowding the
+  primary view.
+- When the histogram overflows the panel, the last visible row is
+  replaced with a `… press 'd' for full AP list` hint instead of
+  silently truncating.
+
+**What this buys.** The panel stays readable — and operationally
+meaningful — under macOS redaction, because occupancy doesn't need
+identities. It also reframes the question from "what exists" to
+"what pressure am *I* under", which is what the operator actually
+wanted to know.
+
+**Untouched.** Bus shape, lifecycle pipeline, gateway/DNS sensors,
+observation confidence, macOS backend layering, trend rules. The
+pivot is contained to one rule + one panel + a couple of small
+event-model exposures.
+
+`cargo test --workspace`: 30/30 green.
 
 ### 2026-05-28 — Claude Opus 4.7 (connected link / RF environment split)
 

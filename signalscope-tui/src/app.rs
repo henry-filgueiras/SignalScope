@@ -139,6 +139,9 @@ fn handle_input(ev: CtEvent, state: &mut AppState) -> InputOutcome {
             (KeyCode::Char('?') | KeyCode::Char('h'), _) => {
                 state.show_help = !state.show_help;
             }
+            (KeyCode::Char('d'), _) => {
+                state.show_neighbor_detail = !state.show_neighbor_detail;
+            }
             (KeyCode::Char('f'), _) => {
                 state.focus = state.focus.next();
             }
@@ -204,6 +207,10 @@ pub struct AppState {
     pub signal_history: VecDeque<SignalSample>,
     pub focus: Focus,
     pub show_help: bool,
+    /// When true, the RF environment panel renders the neighbor AP table
+    /// instead of the occupancy histogram. Default is the histogram —
+    /// individual identities are demoted to opt-in detail.
+    pub show_neighbor_detail: bool,
 }
 
 impl AppState {
@@ -222,6 +229,7 @@ impl AppState {
             signal_history: VecDeque::with_capacity(SIGNAL_HISTORY),
             focus: Focus::Overview,
             show_help: false,
+            show_neighbor_detail: false,
         }
     }
 

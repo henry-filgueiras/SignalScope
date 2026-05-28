@@ -23,9 +23,11 @@ architectural goal — see [`docs/architecture.md`](docs/architecture.md) and
   PHY mode) driven by `system_profiler -xml SPAirPortDataType` on macOS,
   with a legacy `airport` fallback. Includes a longitudinal "held for"
   duration, a 60 s Δ RSSI callout, and a recent-RSSI sparkline.
-- **RF environment** panel with busiest-channel summary, density trend
-  indicator, and the visible neighbor list (band, channel, 6 GHz /
-  Wi-Fi 6E support)
+- **RF environment** panel anchored on the connected channel: header
+  reads `connected ch44 · pressure: moderate · density stable`, body
+  is a per-band channel-occupancy histogram with the connected channel
+  highlighted, and the identity-oriented AP table is one `d` keypress
+  away when you want it
 - sensor-health surface — when Wi-Fi is off, redacted, or a backend is
   missing, the card shows the actual state instead of going silent
 - per-observation confidence tags (`Direct` / `Inferred` / `Estimated`
@@ -75,6 +77,7 @@ Keyboard:
 | `q` / `Esc`    | quit              |
 | `Ctrl-C`       | quit              |
 | `Tab` / `f`    | cycle focus       |
+| `d`            | toggle RF view (occupancy histogram ↔ AP table) |
 | `?` / `h`      | toggle help       |
 
 ## Workspace layout

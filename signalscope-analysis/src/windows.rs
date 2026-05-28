@@ -24,6 +24,7 @@ use time::OffsetDateTime;
 pub struct WifiState {
     pub current_ssid: Option<Ssid>,
     pub current_bssid: Option<Bssid>,
+    pub current_channel: Option<signalscope_events::Channel>,
     pub last_rssi_dbm: Option<i32>,
     pub last_neighbors: Vec<NeighborAp>,
     pending_roam: Option<RoamDetected>,
@@ -45,6 +46,7 @@ impl WifiState {
         }
         self.current_ssid = obs.ssid.clone();
         self.current_bssid = obs.bssid.clone();
+        self.current_channel = obs.channel;
         self.last_rssi_dbm = obs.rssi_dbm;
     }
 

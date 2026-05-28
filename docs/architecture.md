@@ -103,11 +103,19 @@ the UI is shaped to mirror them:
   *my current lifeline*. Anything that disturbs it directly affects the
   operator. The card includes a small recent-RSSI sparkline and a
   Δ-over-60s callout for at-a-glance trend awareness.
-- **RF environment** — ambient AP activity around the host. Sparse,
-  probabilistic, frequently redacted on modern macOS. This is *the
-  weather*. The panel summarises density and busiest channel and shows
-  a calm trend indicator (`density rising` / `falling` / `stable`)
-  driven by the current `RfDensityTrend` finding state.
+- **RF environment** — ambient AP activity treated as sparse and
+  probabilistic. This is *the weather*. The panel is *anchored on the
+  connected channel* rather than the global busiest, because the
+  operational question is "how hostile is the airspace around my
+  connection?" The header reads `connected ch44 · pressure: moderate
+  · density stable`; the body is a per-band channel-occupancy
+  histogram with the connected channel marked. Identity (SSID/BSSID)
+  rows are demoted behind a `d` toggle — modern macOS frequently
+  redacts them anyway, so occupancy is the more reliable layer.
+  Pressure is a coarse four-tier ladder
+  (`Low` / `Moderate` / `Elevated` / `Severe`) shared between analysis
+  (which fires `RfCongestion` from `Elevated` upward) and the panel
+  header (which surfaces every tier).
 
 That conceptual split also lives in `signalscope-analysis`. Two new
 windows in `analysis/windows.rs`:

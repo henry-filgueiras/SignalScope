@@ -32,6 +32,7 @@ mod rules;
 mod windows;
 
 pub use lifecycle::LifecycleConfig;
+pub use rules::{pressure_tier, PressureTier};
 use lifecycle::LifecycleTracker;
 use windows::{
     DnsWindow, GatewayWindow, RfEnvironmentWindow, WifiSignalWindow, WifiState,

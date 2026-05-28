@@ -2,14 +2,17 @@
 //! mutation. Layouts recompute from the frame area on every draw, so resize
 //! is automatically supported.
 
+use std::collections::BTreeMap;
+
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Wrap};
 use ratatui::Frame;
+use signalscope_analysis::{pressure_tier, PressureTier};
 use signalscope_events::{
-    CorrelationFinding, DnsLatencyObservation, EventCategory, FindingLifecycle,
+    BandClass, CorrelationFinding, DnsLatencyObservation, EventCategory, FindingLifecycle,
     GatewayLatencyObservation, NeighborAp, ObservationConfidence, SensorHealth, SensorState,
 };
 
@@ -61,15 +64,24 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         crate::app::Focus::Neighbors => "neighbors",
         crate::app::Focus::Findings => "findings",
     };
+    let detail_label = if state.show_neighbor_detail {
+        "AP table"
+    } else {
+        "occupancy"
+    };
     let line = Line::from(vec![
         Span::styled("q ", theme::value()),
         Span::styled("quit ", theme::dim()),
         Span::styled(" · tab ", theme::value()),
         Span::styled("focus ", theme::dim()),
+        Span::styled(" · d ", theme::value()),
+        Span::styled("RF view ", theme::dim()),
         Span::styled(" · ? ", theme::value()),
         Span::styled("help ", theme::dim()),
         Span::styled("    focus: ", theme::dim()),
         Span::styled(focus_label, Style::default().fg(theme::INFO_FG)),
+        Span::styled("   RF: ", theme::dim()),
+        Span::styled(detail_label, Style::default().fg(theme::INFO_FG)),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -471,27 +483,205 @@ fn render_rf_environment(f: &mut Frame, area: Rect, state: &AppState) {
         .as_ref()
         .map(|s| s.neighbors.as_slice())
         .unwrap_or(&[]);
-    let current = state.latest_wifi.as_ref();
 
+    let mode_hint = if state.show_neighbor_detail { "detail" } else { "occupancy" };
     let block = card_block(&format!(
-        "RF environment · {} APs visible",
+        "RF environment · {} APs visible · {mode_hint}",
         neighbors.len()
     ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let summary = environmental_summary(neighbors, state);
+    let connected_channel = state.latest_wifi.as_ref().and_then(|w| w.channel);
+    let summary = environmental_summary(neighbors, connected_channel, state);
+
     let layout = Layout::new(
         Direction::Vertical,
-        [Constraint::Length(1), Constraint::Min(1)],
+        [
+            Constraint::Length(1), // summary
+            Constraint::Length(1), // spacer
+            Constraint::Min(1),    // body
+        ],
     )
     .split(inner);
     f.render_widget(Paragraph::new(summary), layout[0]);
-    let list_area = layout[1];
 
+    if state.show_neighbor_detail {
+        render_neighbor_table(f, layout[2], neighbors, state.latest_wifi.as_ref());
+    } else {
+        render_occupancy_histogram(f, layout[2], neighbors, connected_channel);
+    }
+}
+
+/// One-line "ambient weather report" for the RF environment card.
+/// Anchored on the *connected* channel — modern Wi-Fi pain is local, not
+/// global. Density trend reads off the active `RfDensityTrend` finding
+/// so the panel agrees with the findings list rather than computing a
+/// parallel verdict.
+fn environmental_summary<'a>(
+    neighbors: &[NeighborAp],
+    connected_channel: Option<signalscope_events::Channel>,
+    state: &'a AppState,
+) -> Line<'a> {
+    let per_channel = per_channel_counts(neighbors);
+
+    let (anchor_spans, anchor_count) = match connected_channel {
+        Some(c) => {
+            let n = per_channel.get(&c.number).copied().unwrap_or(0);
+            let tier = pressure_tier(n);
+            let (tier_color, tier_label) = (tier_color(tier), tier.headline_label());
+            (
+                vec![
+                    Span::styled("connected ch", theme::dim()),
+                    Span::styled(format!("{}", c.number), theme::value()),
+                    Span::styled("  ·  pressure: ", theme::dim()),
+                    Span::styled(
+                        tier_label.to_string(),
+                        Style::default().fg(tier_color).add_modifier(Modifier::BOLD),
+                    ),
+                ],
+                n,
+            )
+        }
+        None => (
+            vec![Span::styled("unassociated", theme::dim())],
+            0usize,
+        ),
+    };
+    let _ = anchor_count;
+
+    let rising = state.findings.contains_key("rf_density_trend:rising");
+    let falling = state.findings.contains_key("rf_density_trend:falling");
+    let (trend, trend_color) = match (rising, falling) {
+        (true, _) => ("density rising", theme::WARN_FG),
+        (_, true) => ("density falling", theme::INFO_FG),
+        _ => ("density stable", theme::DIM_FG),
+    };
+
+    let mut spans = anchor_spans;
+    spans.push(Span::styled("  ·  ", theme::dim()));
+    spans.push(Span::styled(trend, Style::default().fg(trend_color)));
+    Line::from(spans)
+}
+
+/// Primary visualization: per-band channel occupancy bars. The connected
+/// channel — if any — is marked with a trailing arrow so it remains the
+/// natural anchor for the eye. Bars are one block per AP, capped to keep
+/// the panel compact.
+fn render_occupancy_histogram(
+    f: &mut Frame,
+    area: Rect,
+    neighbors: &[NeighborAp],
+    connected_channel: Option<signalscope_events::Channel>,
+) {
+    if neighbors.is_empty() {
+        f.render_widget(
+            Paragraph::new("no RF data yet — awaiting scan").style(theme::dim()),
+            area,
+        );
+        return;
+    }
+
+    // Channels with no band assignment are excluded from the histogram —
+    // they're rare and there's no good place to put them.
+    let mut by_band: BTreeMap<BandSort, BTreeMap<u16, usize>> = BTreeMap::new();
+    for ap in neighbors {
+        let Some(ch) = ap.channel else { continue };
+        by_band
+            .entry(BandSort::from(ch.band))
+            .or_default()
+            .entry(ch.number)
+            .and_modify(|n| *n += 1)
+            .or_insert(1);
+    }
+
+    if by_band.is_empty() {
+        f.render_widget(
+            Paragraph::new("scan reports no channel data\npress 'd' for raw AP details")
+                .style(theme::dim())
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
+
+    const BAR_WIDTH: usize = 14;
+    let max_count = by_band
+        .values()
+        .flat_map(|m| m.values().copied())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (band_sort, channels) in &by_band {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            band_sort.label().to_string(),
+            Style::default().fg(theme::INFO_FG).add_modifier(Modifier::BOLD),
+        )));
+        for (ch, count) in channels {
+            let bar_units = ((*count * BAR_WIDTH) + max_count - 1) / max_count;
+            let bar: String = "█".repeat(bar_units.min(BAR_WIDTH));
+            let padding: String = " ".repeat(BAR_WIDTH.saturating_sub(bar_units));
+
+            let connected = connected_channel.is_some_and(|c| c.number == *ch);
+            let bar_color = if connected {
+                theme::TITLE_FG
+            } else {
+                bar_color_for_count(*count)
+            };
+            let mut spans = vec![
+                Span::styled(
+                    format!("  ch{:<4}", ch),
+                    if connected {
+                        Style::default().fg(theme::TITLE_FG).add_modifier(Modifier::BOLD)
+                    } else {
+                        theme::value()
+                    },
+                ),
+                Span::styled(bar, Style::default().fg(bar_color)),
+                Span::styled(padding, theme::dim()),
+                Span::styled(format!("  {:>2}", count), theme::value()),
+            ];
+            if connected {
+                spans.push(Span::styled(
+                    "  ← connected",
+                    Style::default().fg(theme::TITLE_FG),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+
+    let total = lines.len();
+    let visible: Vec<Line> = lines.into_iter().take(area.height as usize).collect();
+    let truncated = total > visible.len();
+    let mut paragraph_lines = visible;
+    if truncated {
+        // Replace the last line with a truncation hint.
+        let last = paragraph_lines.pop();
+        let _ = last;
+        paragraph_lines.push(Line::from(Span::styled(
+            "  …  press 'd' for full AP list",
+            theme::dim(),
+        )));
+    }
+    f.render_widget(Paragraph::new(paragraph_lines), area);
+}
+
+/// Detail mode: the original neighbor table. Kept behind a 'd' toggle so
+/// identity-oriented inspection remains available without crowding the
+/// primary view.
+fn render_neighbor_table(
+    f: &mut Frame,
+    area: Rect,
+    neighbors: &[NeighborAp],
+    current: Option<&signalscope_events::WifiObservation>,
+) {
     let mut sorted: Vec<&NeighborAp> = neighbors.iter().collect();
-    // Sort by RSSI descending. Entries without an RSSI fall to the bottom —
-    // they're still useful for density analysis but not for ranking.
     sorted.sort_by(|a, b| match (a.rssi_dbm, b.rssi_dbm) {
         (Some(x), Some(y)) => y.cmp(&x),
         (Some(_), None) => std::cmp::Ordering::Less,
@@ -503,9 +693,13 @@ fn render_rf_environment(f: &mut Frame, area: Rect, state: &AppState) {
 
     let items: Vec<ListItem> = sorted
         .iter()
-        .take(list_area.height as usize)
+        .take(area.height as usize)
         .map(|ap| {
-            let is_current = ap.bssid.as_ref().zip(current_bssid).map_or(false, |(a, b)| a == b);
+            let is_current = ap
+                .bssid
+                .as_ref()
+                .zip(current_bssid)
+                .map_or(false, |(a, b)| a == b);
             let marker = if is_current { "● " } else { "  " };
             let ssid = ap
                 .ssid
@@ -546,43 +740,58 @@ fn render_rf_environment(f: &mut Frame, area: Rect, state: &AppState) {
         })
         .collect();
 
-    f.render_widget(List::new(items), list_area);
+    f.render_widget(List::new(items), area);
 }
 
-/// One-line "ambient weather report" for the RF environment card.
-/// Surfaces busiest channel and the current density trend (from the
-/// analysis layer's findings, so we agree with the Findings panel on
-/// what's happening rather than computing a parallel verdict).
-fn environmental_summary<'a>(
-    neighbors: &[NeighborAp],
-    state: &'a AppState,
-) -> Line<'a> {
-    let mut per_channel: std::collections::HashMap<u16, usize> =
-        std::collections::HashMap::new();
+fn per_channel_counts(neighbors: &[NeighborAp]) -> std::collections::HashMap<u16, usize> {
+    let mut m = std::collections::HashMap::new();
     for ap in neighbors {
         if let Some(ch) = ap.channel {
-            *per_channel.entry(ch.number).or_insert(0) += 1;
+            *m.entry(ch.number).or_insert(0) += 1;
         }
     }
-    let busiest = per_channel
-        .iter()
-        .max_by_key(|(_, n)| **n)
-        .map(|(ch, n)| format!("busiest ch{ch} ({n} APs)"))
-        .unwrap_or_else(|| "no channel data".into());
+    m
+}
 
-    let rising = state.findings.contains_key("rf_density_trend:rising");
-    let falling = state.findings.contains_key("rf_density_trend:falling");
-    let (trend, trend_color) = match (rising, falling) {
-        (true, _) => ("density rising", theme::WARN_FG),
-        (_, true) => ("density falling", theme::INFO_FG),
-        _ => ("density stable", theme::DIM_FG),
-    };
+fn tier_color(tier: PressureTier) -> Color {
+    match tier {
+        PressureTier::Low => theme::OK_FG,
+        PressureTier::Moderate => theme::INFO_FG,
+        PressureTier::Elevated => theme::WARN_FG,
+        PressureTier::Severe => theme::BAD_FG,
+    }
+}
 
-    Line::from(vec![
-        Span::styled(busiest, theme::value()),
-        Span::styled("   ", theme::dim()),
-        Span::styled(trend, Style::default().fg(trend_color)),
-    ])
+fn bar_color_for_count(count: usize) -> Color {
+    tier_color(pressure_tier(count))
+}
+
+/// Wrapper for ordered display of bands. The `BandClass` enum doesn't
+/// have a deterministic order beyond declaration; we want histogram
+/// sections to consistently read low → high.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct BandSort(u8);
+
+impl BandSort {
+    fn label(self) -> &'static str {
+        match self.0 {
+            0 => "2.4 GHz",
+            1 => "5 GHz",
+            2 => "6 GHz",
+            _ => "unknown band",
+        }
+    }
+}
+
+impl From<BandClass> for BandSort {
+    fn from(b: BandClass) -> Self {
+        BandSort(match b {
+            BandClass::TwoPointFourGhz => 0,
+            BandClass::FiveGhz => 1,
+            BandClass::SixGhz => 2,
+            BandClass::Unknown => 3,
+        })
+    }
 }
 
 fn render_findings(f: &mut Frame, area: Rect, state: &AppState) {
@@ -681,7 +890,7 @@ fn render_feed(f: &mut Frame, area: Rect, state: &AppState) {
 
 fn render_help_overlay(f: &mut Frame, area: Rect) {
     let w = 50.min(area.width.saturating_sub(4));
-    let h = 9.min(area.height.saturating_sub(4));
+    let h = 11.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
@@ -698,6 +907,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         Line::from("q / Esc        quit"),
         Line::from("Ctrl-C         quit"),
         Line::from("tab / f        cycle focus"),
+        Line::from("d              toggle RF view (occupancy ↔ AP table)"),
         Line::from("?  / h         toggle this help"),
         Line::from(""),
         Line::from(Span::styled(

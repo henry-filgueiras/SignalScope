@@ -75,34 +75,180 @@ pub fn evaluate(
     out
 }
 
+/// Local connected-channel congestion. The brief is "how hostile is the
+/// airspace around my current connection?" — not "what channel is busiest
+/// globally?" When unassociated, the rule stays silent rather than
+/// claiming congestion against a channel nobody is sitting on.
 fn rf_congestion(wifi: &WifiState) -> Option<CandidateFinding> {
+    let connected_channel = wifi.current_channel?;
     let counts = wifi.neighbors_per_channel();
-    if counts.is_empty() {
-        return None;
-    }
-    let (busiest_ch, busiest_count) = counts.iter().max_by_key(|(_, n)| **n)?;
-    if *busiest_count < 6 {
+    let local_count = counts.get(&connected_channel.number).copied().unwrap_or(0);
+
+    let tier = pressure_tier(local_count);
+    // We only emit a finding from elevated upward — moderate / low live in
+    // the panel header and don't deserve their own lifecycle entry.
+    if tier < PressureTier::Elevated {
         return None;
     }
 
-    let confidence = match busiest_count {
-        6..=8 => 0.45,
-        9..=12 => 0.65,
-        _ => 0.8,
+    let confidence = match tier {
+        PressureTier::Elevated => 0.55,
+        PressureTier::Severe => 0.8,
+        _ => return None,
     };
 
+    let label = tier.headline_label();
     Some(CandidateFinding {
         kind: FindingKind::RfCongestion,
-        fingerprint: format!("rf_congestion:ch{busiest_ch}"),
+        fingerprint: format!("rf_congestion:ch{}", connected_channel.number),
         headline: format!(
-            "RF congestion on channel {busiest_ch} ({busiest_count} APs visible)"
+            "Local RF congestion {label} on channel {} ({local_count} APs share the channel)",
+            connected_channel.number
         ),
         confidence,
         evidence: vec![
-            format!("Neighbor APs on channel {busiest_ch}: {busiest_count}"),
+            format!(
+                "APs on connected channel ({}): {local_count}",
+                connected_channel.number
+            ),
             format!("Total visible APs: {}", wifi.last_neighbors.len()),
+            format!("Local pressure tier: {label}"),
         ],
     })
+}
+
+/// Coarse interpretation of local channel pressure. Deliberately a small
+/// ladder, deliberately not exposed as a percentage — the brief is
+/// "preserve epistemic humility." Used by both the analysis rule (which
+/// fires from `Elevated` upward) and the TUI (which surfaces every tier
+/// in the panel header).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PressureTier {
+    Low,
+    Moderate,
+    Elevated,
+    Severe,
+}
+
+impl PressureTier {
+    pub fn headline_label(self) -> &'static str {
+        match self {
+            PressureTier::Low => "low",
+            PressureTier::Moderate => "moderate",
+            PressureTier::Elevated => "elevated",
+            PressureTier::Severe => "severe",
+        }
+    }
+}
+
+/// Map AP-on-channel count to a pressure tier. The thresholds are coarse
+/// on purpose — finer gradations would over-claim certainty against
+/// inherently sparse / probabilistic scan data.
+pub fn pressure_tier(local_count: usize) -> PressureTier {
+    match local_count {
+        0..=2 => PressureTier::Low,
+        3..=5 => PressureTier::Moderate,
+        6..=8 => PressureTier::Elevated,
+        _ => PressureTier::Severe,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use signalscope_events::{
+        BandClass, Bssid, Channel, NeighborAp, ObservationConfidence, Ssid,
+    };
+
+    fn neighbor_on(channel_num: u16) -> NeighborAp {
+        NeighborAp {
+            bssid: None,
+            ssid: None,
+            rssi_dbm: None,
+            channel: Some(Channel::new(
+                channel_num,
+                BandClass::from_channel_number(channel_num),
+                None,
+            )),
+            security: None,
+            phy_mode: None,
+            confidence: ObservationConfidence::Inferred,
+        }
+    }
+
+    fn wifi_state(connected_ch: Option<u16>, neighbors: Vec<NeighborAp>) -> WifiState {
+        let mut s = WifiState::default();
+        s.current_ssid = Some(Ssid::new("HomeAP"));
+        s.current_bssid = Some(Bssid::new("aa:bb:cc:dd:ee:01"));
+        s.current_channel = connected_ch.map(|n| {
+            Channel::new(n, BandClass::from_channel_number(n), None)
+        });
+        s.last_neighbors = neighbors;
+        s
+    }
+
+    #[test]
+    fn pressure_tier_ladder() {
+        assert_eq!(pressure_tier(0), PressureTier::Low);
+        assert_eq!(pressure_tier(2), PressureTier::Low);
+        assert_eq!(pressure_tier(3), PressureTier::Moderate);
+        assert_eq!(pressure_tier(5), PressureTier::Moderate);
+        assert_eq!(pressure_tier(6), PressureTier::Elevated);
+        assert_eq!(pressure_tier(8), PressureTier::Elevated);
+        assert_eq!(pressure_tier(9), PressureTier::Severe);
+        assert_eq!(pressure_tier(50), PressureTier::Severe);
+    }
+
+    #[test]
+    fn congestion_stays_silent_when_unassociated() {
+        let neighbors: Vec<NeighborAp> = (0..10).map(|_| neighbor_on(11)).collect();
+        let state = wifi_state(None, neighbors);
+        assert!(
+            rf_congestion(&state).is_none(),
+            "no connected channel → no local-congestion claim"
+        );
+    }
+
+    #[test]
+    fn congestion_stays_silent_when_connected_channel_quiet() {
+        // Channel 6 is crowded but we're on 36 (which has nothing).
+        let mut neighbors: Vec<NeighborAp> = (0..10).map(|_| neighbor_on(6)).collect();
+        neighbors.push(neighbor_on(36)); // self
+        let state = wifi_state(Some(36), neighbors);
+        assert!(
+            rf_congestion(&state).is_none(),
+            "global busy channel ≠ local pressure"
+        );
+    }
+
+    #[test]
+    fn congestion_fires_only_from_elevated() {
+        // 5 neighbors on the connected channel → moderate, no finding.
+        let neighbors: Vec<NeighborAp> = (0..5).map(|_| neighbor_on(11)).collect();
+        let state = wifi_state(Some(11), neighbors);
+        assert!(rf_congestion(&state).is_none(), "moderate tier shouldn't fire");
+
+        // 7 neighbors → elevated → fires.
+        let neighbors: Vec<NeighborAp> = (0..7).map(|_| neighbor_on(11)).collect();
+        let state = wifi_state(Some(11), neighbors);
+        let f = rf_congestion(&state).expect("elevated should fire");
+        assert!(f.fingerprint.ends_with(":ch11"));
+        assert!(f.headline.contains("elevated"));
+    }
+
+    #[test]
+    fn congestion_fingerprint_follows_connected_channel() {
+        let neighbors_a: Vec<NeighborAp> = (0..7).map(|_| neighbor_on(11)).collect();
+        let state_a = wifi_state(Some(11), neighbors_a);
+        let neighbors_b: Vec<NeighborAp> = (0..7).map(|_| neighbor_on(36)).collect();
+        let state_b = wifi_state(Some(36), neighbors_b);
+        let a = rf_congestion(&state_a).unwrap();
+        let b = rf_congestion(&state_b).unwrap();
+        assert_ne!(
+            a.fingerprint, b.fingerprint,
+            "different connected channels → different fingerprints, so a roam triggers Resolved + new Active"
+        );
+    }
 }
 
 fn gateway_instability(gateway: &GatewayWindow) -> Option<CandidateFinding> {
