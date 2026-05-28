@@ -22,7 +22,8 @@ A Cargo workspace with five crates:
 - `signalscope-events` — normalized, platform-agnostic event/observation
   types. The lingua franca of the system.
 - `signalscope-core` — append-only in-memory event bus (broadcast +
-  bounded backlog), clock abstraction, tracing setup.
+  bounded backlog), clock abstraction, tracing setup, session
+  recorder/reader, `EventSource` abstraction.
 - `signalscope-sensors` — `Sensor` trait + per-source adapters. Currently:
   Wi-Fi (macOS, primary backend `system_profiler -xml SPAirPortDataType`,
   legacy `airport` retained as a fallback for pre-Sonoma hosts), gateway
@@ -155,12 +156,66 @@ only see normalized `WifiObservation` / `NeighborAp` / `SensorHealth`.
 The TUI's Wi-Fi card title surfaces the active backend so the operator
 can tell, but no code path outside `wifi/macos/` branches on it.
 
+### Session recording
+
+A single run can be preserved as a `.signalscope-session` file: append-
+only newline-delimited JSON, first line a versioned `SessionHeader`,
+every subsequent line one `SessionRow::Envelope` carrying a published
+bus envelope verbatim. The recorder is one async task that subscribes
+to the bus (backlog included, in order) and writes through a
+`BufWriter<File>` with a per-row `flush()` — an abrupt kill loses at
+most the most recent observation, never the tail. The format is
+deliberately:
+
+- **Append-only** — rows are never rewritten.
+- **Inspectable** — `tail -f`, `jq`, `wc -l` all work; not a database,
+  not binary, not compressed (yet).
+- **Versioned** — `SESSION_FORMAT_VERSION` is checked on read; future-
+  newer files are rejected rather than silently misinterpreted, and
+  the reader tolerates unknown header fields so writers can grow.
+- **Semantically faithful** — what the bus carries is what gets
+  recorded, including lifecycle transitions, observation confidence,
+  sensor-health distinctions, and monotonic `EventId`s.
+
+`SessionRow` is a tagged enum so future row kinds (replay markers,
+operator notes) can land without breaking the existing shape.
+
+### Event source abstraction
+
+`core::source::EventSource` is a tiny pull trait — `async fn
+next_envelope() -> Option<Arc<Envelope>>`. Two implementors today:
+the live bus `Subscription` and `FileEventSource` (replay from a
+session file). The trait exists to keep replay foundations in place
+without committing to a replay UI: an analyzer or a test harness can
+be written against `EventSource` and run against either source. No
+seeking, no pacing controls — those remain explicit future work.
+
+### Two-mode binary
+
+The `signalscope` binary now dispatches on subcommand:
+
+- `signalscope observe` — the live TUI dashboard. Optional
+  `--record PATH` mirrors every envelope to a session file at the
+  same time, so the operator can promote a live observation into a
+  permanent artifact without restarting. The bare invocation (no
+  subcommand) still means `observe`, so existing muscle memory holds.
+- `signalscope capture --output PATH` — headless recording. Same
+  sensor + analysis pipeline, no ratatui. Emits a one-line stderr
+  status every 5 s (`wifi=… scan=… gw=… dns=… find=… health=…`) so
+  the operator can tell the run is healthy without a dashboard.
+  Ctrl-C stops cleanly, prints the elapsed duration and final path.
+
+Arg parsing is hand-rolled; no `clap` dependency. The intent is
+non-technical collection and portable diagnostics, not a daemon
+platform.
+
 ### Phase 1 scope
 
-In: Wi-Fi link + scan, gateway probe, DNS probe, lightweight correlation,
-TUI dashboard.
-Out: packet capture, monitor mode, offensive tooling, persistence, replay,
-web UI, plugin system.
+In: Wi-Fi link + scan, gateway probe, DNS probe, lightweight
+correlation, TUI dashboard, append-only JSONL session recording with
+a minimal replay-read path.
+Out: packet capture, monitor mode, offensive tooling, replay UI,
+timeline scrubbers, web UI, plugin system.
 
 ### Platform stance
 
@@ -178,7 +233,10 @@ The TUI owns the terminal, so logs go to a rotating file under
 
 - Replace `ping(8)` subprocess with a `socket2`-based ICMP/UDP probe to
   shed the per-tick fork+exec cost.
-- Decide when persistence is justified (JSONL first, SQLite later).
+- Whether SQLite ever earns its keep over JSONL. The current bet is
+  that JSONL stays the primary artifact and any future indexed store
+  is a derived view computed from it — keeping the recording shape
+  inspectable and forward-compatible.
 - Decide whether to ship a Location-Services-aware setup path on macOS
   so the operator can see real SSIDs/BSSIDs when desired. Today they
   enable LS for Terminal manually; SignalScope's only job is to be
@@ -191,6 +249,106 @@ The TUI owns the terminal, so logs go to a rotating file under
 ---
 
 ## Resolved Dragons and Pivots
+
+### 2026-05-28 — Claude Opus 4.7 (session recording + capture mode)
+
+**Demoted from Canon, verbatim:**
+
+> - `signalscope-core` — append-only in-memory event bus (broadcast +
+>   bounded backlog), clock abstraction, tracing setup.
+
+> ### Phase 1 scope
+>
+> In: Wi-Fi link + scan, gateway probe, DNS probe, lightweight correlation,
+> TUI dashboard.
+> Out: packet capture, monitor mode, offensive tooling, persistence, replay,
+> web UI, plugin system.
+
+> - Decide when persistence is justified (JSONL first, SQLite later).
+
+**Goal.** Introduce durable observability session recording and the
+minimal foundations for future replay — without becoming a database
+project. Sessions should be portable forensic artifacts: a flaky
+laptop captures a run, ships the file somewhere, replays offline.
+
+**Format.** A session is newline-delimited JSON. Line 1 is a
+`SessionHeader` (`kind: "signalscope-session"`, `format_version`,
+`created_at`, `tool_version`, optional operator `label`). Every
+subsequent line is a `SessionRow::Envelope` carrying the bus envelope
+verbatim — same `EventId`, same wall-clock `at`, same `source`, same
+typed event payload. Lifecycle transitions, observation confidence,
+sensor-health distinctions all survive the round-trip. The tagged-
+enum row framing means we can add `SessionRow::Marker` /
+`SessionRow::Note` later without breaking readers.
+
+The format is deliberately not a database. No SQLite, no binary
+framing, no compression. `tail -f`, `jq`, `wc -l` all work. When
+those constraints start hurting we will revisit, but inspectability
+and forward-compatibility win today.
+
+**Code.** Two new modules in `signalscope-core`:
+
+- `session` — `SessionWriter` (cloneable handle backed by
+  `BufWriter<File>` behind a `Mutex`; per-row flush so abrupt
+  termination loses at most the most recent observation, never the
+  tail). `SessionReader` (streaming iterator that reads + validates
+  the header on construction and yields envelopes in file order).
+  `spawn_recorder(bus, writer)` — one async task that seeds the
+  backlog and then drains the bus subscription into the file.
+  `SessionReadError` distinguishes missing header, wrong kind,
+  future-newer `format_version`, malformed JSON line, and duplicate
+  header.
+- `source` — `EventSource` trait with `async fn
+  next_envelope() -> Option<Arc<Envelope>>`. Implementations: the
+  bus `Subscription` (live) and `FileEventSource` (replay-from-
+  file). This is the smallest interface that lets future code be
+  written generically over "live or replayed" without committing to
+  any replay UI.
+
+**Binary.** The `signalscope` binary grew subcommands:
+
+- `signalscope observe [--record PATH] [--label TEXT]` — the live
+  TUI. `--record` mirrors every envelope into a session file in
+  parallel with the dashboard, so a live observation can be
+  promoted to a forensic artifact without restarting. Bare
+  invocation (no subcommand) defaults to `observe`.
+- `signalscope capture --output PATH [--label TEXT]` — headless
+  recording. Same sensor + analysis stack, no ratatui. A 5-second
+  stderr status line shows running counts per category so the
+  operator can confirm the run is healthy. Ctrl-C stops cleanly
+  and prints the elapsed duration + final path.
+
+Arg parsing is hand-rolled — no `clap` dependency. The intent is
+non-technical collection, not a daemon platform.
+
+**Tests.** Five new tests in `signalscope-core`:
+
+- `round_trip_preserves_envelopes_in_order` — write 5 envelopes,
+  read them back, confirm `id` / `at` / `source` align.
+- `round_trip_carries_dns_event_intact` — confirm the DNS payload
+  shape survives (resolver, query, RTT, answered).
+- `rejects_file_with_no_header` — `MissingHeader`.
+- `rejects_future_format_version` — `UnsupportedVersion`.
+- `rejects_wrong_kind` — `WrongKind`.
+
+`cargo test --workspace`: 41/41 green (up from 36).
+
+**What this buys.**
+
+- "Capture now, analyze later" is now a real workflow.
+- Forensic sessions are inspectable with stock UNIX tools.
+- Replay foundations exist (a `FileEventSource` is interchangeable
+  with a bus `Subscription` in spirit) without dragging a replay UI
+  into Phase 1.
+- The recording shape is the bus shape — no derived-only summaries
+  flattened in. Future analyzers improving means re-running them
+  over preserved sessions still works.
+
+**Untouched.** Bus shape and invariants, lifecycle pipeline,
+gateway/DNS sensors, observation confidence, macOS backend layering,
+trend rules, RF occupancy panel, finding fingerprints. The change
+is purely additive — a new module in core, a new module in the bin
+crate, a new `--record` flag.
 
 ### 2026-05-28 — Claude Opus 4.7 (flat relevance-ranked occupancy)
 

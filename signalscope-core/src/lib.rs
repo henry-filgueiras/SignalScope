@@ -10,6 +10,13 @@
 pub mod bus;
 pub mod clock;
 pub mod logging;
+pub mod session;
+pub mod source;
 
 pub use bus::{EventBus, Subscription};
 pub use clock::{Clock, SystemClock};
+pub use session::{
+    spawn_recorder, SessionHeader, SessionReadError, SessionReader, SessionRow, SessionWriter,
+    SESSION_FORMAT_VERSION, SESSION_KIND,
+};
+pub use source::{EventSource, FileEventSource};
