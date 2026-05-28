@@ -471,7 +471,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
 
 // ---------- helpers ----------
 
-fn card_block(title: &str) -> Block<'_> {
+fn card_block(title: &str) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_style(theme::frame())

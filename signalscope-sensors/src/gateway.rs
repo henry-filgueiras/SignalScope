@@ -51,8 +51,8 @@ impl Sensor for GatewaySensor {
     }
 
     fn spawn(self, bus: Arc<EventBus>) -> JoinHandle<()> {
-        let cfg = self.cfg;
         let id = self.id();
+        let cfg = self.cfg;
         tokio::spawn(async move { run(id, cfg, bus).await })
     }
 }

@@ -89,6 +89,36 @@ The TUI owns the terminal, so logs go to a rotating file under
 
 ## Resolved Dragons and Pivots
 
+### 2026-05-28 — Claude Opus 4.7 (cargo check follow-up)
+
+**Bootstrap compiles clean.** A Rust toolchain became available
+(Homebrew, cargo/rustc 1.95.0) and `cargo check --workspace` revealed six
+small issues, all fixed in this exchange:
+
+- `signalscope-analysis/src/rules.rs`: mixed `f32`/`f64` arithmetic in
+  the gateway-instability and DNS-pathology confidence calculations.
+  Resolved by promoting to `f64` and casting back to `f32` at the
+  `Confidence::new` boundary.
+- `signalscope-{wifi,gateway,dns}` sensors: `Sensor::spawn(self, ...)`
+  partially moved `self.cfg` before calling `self.id()`. Trivial
+  reorder.
+- `signalscope-events::FindingKind`: missing `Hash` derive — needed
+  because the TUI keys its findings panel by `FindingKind` in a
+  `HashMap`. Added `Hash` to the derive list.
+- `signalscope-tui::ui::card_block`: lifetime elision tied the returned
+  `Block` to the temporary `format!(...)` String passed in. Changed the
+  return type to `Block<'static>` (the body produces an owned title via
+  `format!`, so the lifetime independence is honest).
+- Two `dead_code` warnings on unused `samples()` iterators on the
+  window structs removed — these were speculative and YAGNI applied.
+
+`cargo test --workspace` now runs 4 tests (Wi-Fi parser, channel spec
+parser, ping-RTT parser, ping-no-reply parser) green.
+
+The earlier "no cargo check was possible" caveat from the bootstrap
+entry is therefore resolved; the highest-priority follow-up is now to
+actually run `signalscope` on a macOS host and iterate on the TUI feel.
+
 ### 2026-05-28 — Claude Opus 4.7
 
 **Bootstrap of the repository.** Created the five-crate workspace, the

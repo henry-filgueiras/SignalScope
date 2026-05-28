@@ -99,10 +99,6 @@ impl GatewayWindow {
         }
     }
 
-    pub fn samples(&self) -> impl Iterator<Item = &GatewaySample> {
-        self.samples.iter()
-    }
-
     pub fn len(&self) -> usize {
         self.samples.len()
     }
@@ -204,10 +200,6 @@ impl DnsWindow {
         }
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         Some(v[v.len() / 2])
-    }
-
-    pub fn samples(&self) -> impl Iterator<Item = &DnsSample> {
-        self.samples.iter()
     }
 
     pub fn len(&self) -> usize {

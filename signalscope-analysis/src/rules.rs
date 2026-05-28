@@ -76,8 +76,8 @@ fn gateway_instability(gateway: &GatewayWindow) -> Option<CorrelationFinding> {
         return None;
     }
 
-    let confidence = (loss * 1.5 + (jitter_ratio - 1.0).min(5.0) * 0.10)
-        .clamp(0.0, 0.95);
+    let confidence = ((loss as f64) * 1.5 + (jitter_ratio - 1.0).min(5.0) * 0.10)
+        .clamp(0.0, 0.95) as f32;
 
     Some(CorrelationFinding {
         kind: FindingKind::GatewayInstability,
@@ -114,12 +114,13 @@ fn dns_pathology(dns: &DnsWindow, gateway: &GatewayWindow) -> Option<Correlation
         return None;
     }
 
+    let fail64 = fail as f64;
     let confidence = if gateway_is_healthy {
-        (fail * 1.5 + (dns_median / 1000.0)).clamp(0.3, 0.9)
+        (fail64 * 1.5 + dns_median / 1000.0).clamp(0.3, 0.9) as f32
     } else {
         // Gateway also looks bad — DNS may just be downstream of the network
         // issue. Lower confidence.
-        (fail + (dns_median / 2000.0)).clamp(0.15, 0.55)
+        (fail64 + dns_median / 2000.0).clamp(0.15, 0.55) as f32
     };
 
     Some(CorrelationFinding {

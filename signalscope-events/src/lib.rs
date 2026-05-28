@@ -109,7 +109,7 @@ pub struct CorrelationFinding {
     pub evidence: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FindingKind {
     RfCongestion,
     ApOverload,
