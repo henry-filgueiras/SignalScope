@@ -249,7 +249,8 @@ fn handle_replay_input(ev: CtEvent, state: &mut AppState) -> InputOutcome {
             _ => {}
         }
         // Seek bindings. Shift-modified brackets ({, }) jump 10 events.
-        // Single brackets step one event. Home/End to either end.
+        // Single brackets step one event. n / p hop between landmarks.
+        // Home/End and g/G jump to recording boundaries.
         let moved = match (k.code, k.modifiers) {
             (KeyCode::Char('['), _) => seek(state, -1),
             (KeyCode::Char(']'), _) => seek(state, 1),
@@ -259,6 +260,8 @@ fn handle_replay_input(ev: CtEvent, state: &mut AppState) -> InputOutcome {
             (KeyCode::Right, KeyModifiers::SHIFT) => seek(state, 10),
             (KeyCode::Left, _) => seek(state, -1),
             (KeyCode::Right, _) => seek(state, 1),
+            (KeyCode::Char('n'), _) => seek_to_next_landmark(state),
+            (KeyCode::Char('p'), _) => seek_to_prev_landmark(state),
             (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => seek_to_start(state),
             (KeyCode::End, _) | (KeyCode::Char('G'), _) => seek_to_end(state),
             _ => false,
@@ -285,6 +288,18 @@ fn seek_to_start(state: &mut AppState) -> bool {
 fn seek_to_end(state: &mut AppState) -> bool {
     match state.playback.as_mut() {
         Some(p) => p.seek_to_end(),
+        None => false,
+    }
+}
+fn seek_to_next_landmark(state: &mut AppState) -> bool {
+    match state.playback.as_mut() {
+        Some(p) => p.seek_to_next_landmark(),
+        None => false,
+    }
+}
+fn seek_to_prev_landmark(state: &mut AppState) -> bool {
+    match state.playback.as_mut() {
+        Some(p) => p.seek_to_prev_landmark(),
         None => false,
     }
 }

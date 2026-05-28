@@ -223,6 +223,107 @@ roam / findings / sensor_health). No TUI, no replay, no analysis —
 just the smallest tool that confirms a `.signalscope-session` file
 is what the recipient thinks it is.
 
+### Timeline landmarks (replay compression)
+
+In replay mode, a long recording becomes navigable in seconds via
+**timeline landmarks**: a derived list of "moments worth
+investigating" anchored on real events inside the recording.
+
+`signalscope-tui::landmarks::derive(events) -> Vec<TimelineLandmark>`
+is a **pure function** of the envelope vec — same recording always
+yields the same landmarks, by construction. No real-clock reads, no
+random ordering, no scoring engines, no LLMs. The deriver walks the
+envelope stream once at session load time and produces a landmark
+whenever it sees one of:
+
+- **Finding events.** Every `Event::Finding(_)` is a landmark.
+  The lifecycle pipeline already only emits findings at real
+  transitions (`Active` / `Escalating` / `Recovering` /
+  `Resolved`), so a 1:1 mapping is the lossless choice. Severity
+  follows the lifecycle: Active/Escalating → `Alarm`,
+  Recovering/Resolved → `Recovery`.
+- **Sensor health transitions.** Every `Event::SensorHealth(_)`
+  whose state differs from the previously-observed state for that
+  sensor. The initial `Operational` heartbeat is suppressed (that's
+  the rig powering on, not a moment to jump to); the initial
+  *degraded* state IS surfaced (the recording opened with something
+  already broken).
+- **Gateway stance changes.** Forward-sweep classifier — `Stable`
+  vs `Spiking` vs `Unreachable` based on `rtt > median × 1.5 +
+  5 ms` against a rolling-30-sample median. Emits on every
+  classification flip.
+- **DNS stance changes.** `Answering` vs `Failing` (driven by
+  `answered`). Emits on every flip.
+- **Throughput regime changes.** Per-step rate derived from
+  consecutive counter samples, classified into
+  `Idle / Trickling / Sustained / Bursting` with the same
+  thresholds the dashboard's stance phrase uses (50 Kbps /
+  500 Kbps / 25 Mbps). Counter rebaselines (non-monotonic totals)
+  are ignored rather than emitting a spurious crash-and-recover
+  pair.
+
+Landmark categories: `Finding / Health / Throughput / Gateway /
+Dns`. Severities: `Alarm / Recovery / Notable`. Drives panel
+coloring.
+
+Landmarks are **derived, never persisted**. They are not part of
+the session file format — the recording stays canonical. If the
+deriver evolves, replaying an old recording produces a different
+landmark list but identical playback state at each playhead. That
+asymmetry is deliberate: recordings are the historical record;
+landmarks are the *current* tool's view of what was interesting in
+that record.
+
+### Landmark navigation
+
+`Playback` owns the loaded landmark vec alongside the envelope vec.
+Two new key bindings in replay mode:
+
+- `n` — `Playback::seek_to_next_landmark` — moves the playhead to
+  the `event_index` of the next landmark strictly after the current
+  playhead.
+- `p` — `Playback::seek_to_prev_landmark` — moves the playhead to
+  the most recent landmark strictly before the current playhead.
+
+Both fall back to no-op at the boundaries. Each press triggers the
+same `rebuild_to_playhead` full re-ingest as a bracket-seek, so the
+seeked dashboard is bit-identical to what would have been shown if
+the recording had stopped at that event.
+
+The `Playback::current_landmark_index` accessor returns the
+highest-indexed landmark whose `event_index <= playhead` — the
+"most recent landmark we've crossed," which is what the panel
+highlights.
+
+### Landmarks pane
+
+In replay mode the bottom band (which is the event feed in live
+mode) becomes the **Landmarks** pane. Rows read:
+
+```text
+▸ +00:02:17  FIND  Active · gateway flapping
+  +00:02:35  GW    Gateway spiking · 192.168.1.1 47.2 ms
+  +00:02:48  TPUT  Throughput idle → bursting · RX 28.4 Mbps / TX 3.1 Mbps
+  +00:03:02  DNS   DNS failing · cloudflare.com via system (timeout)
+  +00:03:48  HEAL  wifi → Stale
+```
+
+- `+HH:MM:SS` is offset from the recording's first envelope —
+  compact and analyst-friendly.
+- `CAT` is a fixed-width category tag (FIND / HEAL / TPUT / GW /
+  DNS), colored by category for visual rhythm.
+- The headline is colored by *severity* (red for `Alarm`, green
+  for `Recovery`, dim for `Notable`) so the operator picks out
+  the high-severity rows without reading the words.
+- The current landmark is prefixed `▸`, rendered bold, and the
+  pane scrolls to keep it visible (centered when there's room).
+
+The pane title shows `Landmarks · {current}/{total}` so the
+operator always knows how many landmarks the recording contains
+and where they are in the list.
+
+Live mode retains the event feed.
+
 ### `signalscope analyze` — offline replay
 
 `signalscope analyze PATH` opens a recorded session inside the same
@@ -456,6 +557,123 @@ The TUI owns the terminal, so logs go to a rotating file under
 ---
 
 ## Resolved Dragons and Pivots
+
+### 2026-05-28 — Claude Opus 4.7 (timeline landmarks: replay compression via n/p)
+
+**Goal.** Make a long recording navigable in seconds. Once replay
+was functional the next bottleneck was obvious: a six-hour
+recording has thousands of envelopes; manually `[`/`]`-stepping
+through them is unworkable. Operators need to jump *between
+meaningful moments*, not scrub between events.
+
+**Pivot — derive, don't store.** The recording already contains
+every interesting moment, because the event model already only
+emits at transitions:
+
+- Findings emit at lifecycle edges.
+- Sensor health emits at state changes.
+- Gateway/DNS/throughput don't emit dedicated transition events,
+  but a forward-sweep classifier reproduces what the dashboard's
+  stance phrases already classify on the live state.
+
+So: a pure function over the recorded envelope vec is enough.
+Landmarks live entirely in the TUI crate, are computed once at
+session load, and are not part of the session file format. If we
+ever evolve the classifier, old recordings get the new landmarks
+for free — and that's a feature, because landmarks are "the
+current tool's view of what mattered," not "what the recording
+thought mattered."
+
+**Module — `signalscope-tui::landmarks`.** Public surface:
+`TimelineLandmark { at, event_index, category, severity, headline }`,
+`LandmarkCategory { Finding, Health, Throughput, Gateway, Dns }`,
+`LandmarkSeverity { Alarm, Recovery, Notable }`, and the deriver
+`derive(events) -> Vec<TimelineLandmark>`.
+
+Per-category rules:
+
+- **Findings.** 1:1 with `Event::Finding(_)`. Severity from
+  lifecycle.
+- **Health.** Suppress the initial `Operational` heartbeat per
+  sensor (rig power-on, not a moment); emit everything else.
+  Recovery to `Operational` gets `Recovery` severity, everything
+  else `Alarm`.
+- **Gateway.** Classify each sample as `Stable / Spiking /
+  Unreachable`. Spiking = `rtt > median × 1.5 + 5 ms` against a
+  rolling 30-sample median. Emit on classification flip.
+- **DNS.** Classify as `Answering / Failing`. Emit on flip.
+- **Throughput.** Per-step rate from consecutive counter
+  samples; classify as `Idle / Trickling / Sustained / Bursting`
+  with the same 50 K / 500 K / 25 M bps cutoffs the dashboard's
+  stance phrase uses. Non-monotonic counter samples (sysinfo
+  rebaseline) are skipped rather than emitting a spurious
+  crash-and-recover pair.
+
+**Determinism contract.** `deriver_is_deterministic` and
+`landmarks_are_in_chronological_order` pin the contract: same input
+→ identical output, every run; landmarks always come out time-
+ordered. The deriver does no real-clock reads, no hash-map
+iteration ordering that escapes (only `HashMap<SensorId,
+SensorState>` for per-sensor previous-state lookup, never iterated).
+
+**Playback wiring.** `Playback` grew `landmarks: Arc<[TimelineLandmark]>`
+populated once in `load`. Three navigation methods:
+`current_landmark_index(playhead)` returns the most recent
+landmark crossed by the playhead, `seek_to_next_landmark` /
+`seek_to_prev_landmark` jump strictly forward / backward to the
+adjacent landmark's `event_index`. Both fall back to no-op at the
+boundaries. Each successful seek triggers the same
+`rebuild_to_playhead` full re-ingest as a bracket-seek, so the
+dashboard state at the landmark is bit-identical to "if the
+recording had stopped at this event."
+
+**Input.** `n` / `p` mapped in `handle_replay_input`. The live
+handler is unchanged.
+
+**Pane.** Replay mode's bottom band switches from the event feed
+to a Landmarks pane. Rows: `▸ +HH:MM:SS  CAT  headline`,
+category-colored tag, severity-colored headline (red Alarm /
+green Recovery / dim Notable), bold current row prefixed with
+`▸`. Window centers on the current landmark; falls back gracefully
+at the ends. Pane title shows `Landmarks · {cur}/{total}`. Empty
+recordings (the run was quiet) show "no landmarks in this
+recording" instead of an empty list. Live mode keeps the event
+feed exactly as it was.
+
+**Footer / help.** Footer key hints in replay mode swap `{/}` for
+`n/p · landmark`. Help overlay grew an `n / p  next/prev
+landmark` row, highlighted in `WARN_FG` to draw the operator's
+eye to the primary new navigation primitive.
+
+**Tests.** 14 new tests on top of 71:
+
+- 11 in `landmarks::tests` covering empty input, every-finding-is-
+  a-landmark, initial-Operational suppression, initial-degraded
+  surfacing, health-recovery wording, gateway stance flips
+  (including unreachable runs), DNS stance flips, throughput
+  regime change, counter-reset guard, determinism, and
+  chronological order.
+- 3 in `replay::tests` covering `loads_landmarks_alongside_events`
+  (header + envelopes + landmarks materialized together),
+  `landmark_navigation_jumps_between_landmark_event_indices`
+  (round-trip n/p with two filler-separated landmarks at indices
+  3 and 7), and `current_landmark_index_reflects_playhead_position`
+  (the highlight-tracking accessor).
+
+**Smoke.** `scripts/record.sh 10s -o $tmp --label landmark-smoke`
+on this host: 21 envelopes captured, including 1 finding and 1
+health event (the two strongest landmark sources). The deriver
+would produce landmarks from both plus whatever stance flips
+appeared across the gateway/dns/iface samples.
+
+**Untouched.** Bus shape, event model, sensors, analysis crate
+(rolling windows + lifecycle pipeline + classifiers unchanged),
+session file format, capture/observe/inspect subcommands, scripts,
+live dashboard rendering, TemporalSeries, replay's full state
+rebuild semantics. The change is additive across the TUI crate
+only.
+
+`cargo test --workspace`: 85/85 green (up from 71).
 
 ### 2026-05-28 — Claude Opus 4.7 (offline replay: analyze subcommand + record/analyze scripts)
 

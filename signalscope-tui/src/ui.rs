@@ -34,7 +34,14 @@ pub fn render(f: &mut Frame, state: &AppState) {
 
     render_header(f, outer[0], state);
     render_main(f, outer[1], state);
-    render_feed(f, outer[2], state);
+    // In replay mode the bottom band becomes the landmarks pane —
+    // event feed is less useful when you can hop directly between
+    // moments. In live mode it's still the event feed.
+    if state.playback.is_some() {
+        render_landmarks(f, outer[2], state);
+    } else {
+        render_feed(f, outer[2], state);
+    }
     render_footer(f, outer[3], state);
 
     if state.show_help {
@@ -112,8 +119,8 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
     if state.playback.is_some() {
         spans.push(Span::styled(" · [/] ", theme::value()));
         spans.push(Span::styled("seek ", theme::dim()));
-        spans.push(Span::styled("· {/} ", theme::value()));
-        spans.push(Span::styled("×10 ", theme::dim()));
+        spans.push(Span::styled("· n/p ", theme::value()));
+        spans.push(Span::styled("landmark ", theme::dim()));
         spans.push(Span::styled("· g/G ", theme::value()));
         spans.push(Span::styled("ends ", theme::dim()));
     }
@@ -1326,8 +1333,116 @@ fn render_feed(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(List::new(items), inner);
 }
 
+/// Compact landmarks pane — replay's primary navigation surface.
+/// Lists landmark rows as `+HH:MM:SS · CAT · headline`, color-coded
+/// by severity. Highlights the currently-active landmark (the most
+/// recent one the playhead has crossed) and scrolls so it stays
+/// visible. Empty recordings show a friendly placeholder.
+fn render_landmarks(f: &mut Frame, area: Rect, state: &AppState) {
+    use crate::landmarks::{LandmarkCategory, LandmarkSeverity};
+
+    let Some(p) = state.playback.as_ref() else {
+        return;
+    };
+
+    let title = if p.landmarks.is_empty() {
+        "Landmarks · 0".to_string()
+    } else {
+        let cur = p
+            .current_landmark_index()
+            .map(|i| format!("{}", i + 1))
+            .unwrap_or_else(|| "—".into());
+        format!("Landmarks · {}/{}", cur, p.landmarks.len())
+    };
+    let block = card_block(&title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if p.landmarks.is_empty() {
+        let msg = "no landmarks in this recording — the run was quiet";
+        f.render_widget(Paragraph::new(msg).style(theme::dim()), inner);
+        return;
+    }
+
+    let rows = inner.height as usize;
+    let total = p.landmarks.len();
+    let current = p.current_landmark_index().unwrap_or(0);
+
+    // Center the window on `current`. Clamp so the window fits at the
+    // ends without showing blank rows.
+    let half = rows / 2;
+    let start = if total <= rows {
+        0
+    } else if current < half {
+        0
+    } else if current + (rows - half) >= total {
+        total - rows
+    } else {
+        current - half
+    };
+    let end = (start + rows).min(total);
+
+    let recording_start = p.first_at();
+    let items: Vec<ListItem> = p.landmarks[start..end]
+        .iter()
+        .enumerate()
+        .map(|(rel_i, l)| {
+            let i = start + rel_i;
+            let is_current = i == current;
+            let secs = (l.at - recording_start).whole_seconds().max(0) as u64;
+            let cat_color = match l.category {
+                LandmarkCategory::Finding => theme::WARN_FG,
+                LandmarkCategory::Health => theme::INFO_FG,
+                LandmarkCategory::Throughput => theme::INFO_FG,
+                LandmarkCategory::Gateway => theme::OK_FG,
+                LandmarkCategory::Dns => theme::OK_FG,
+            };
+            let severity_color = match l.severity {
+                LandmarkSeverity::Alarm => theme::BAD_FG,
+                LandmarkSeverity::Recovery => theme::OK_FG,
+                LandmarkSeverity::Notable => theme::DIM_FG,
+            };
+            let cursor = if is_current { "▸ " } else { "  " };
+            let cursor_style = if is_current {
+                Style::default()
+                    .fg(theme::WARN_FG)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                theme::dim()
+            };
+            let mut headline_style = Style::default().fg(severity_color);
+            if is_current {
+                headline_style = headline_style.add_modifier(Modifier::BOLD);
+            }
+            ListItem::new(Line::from(vec![
+                Span::styled(cursor.to_string(), cursor_style),
+                Span::styled(fmt_offset_clock(secs), theme::value()),
+                Span::styled("  ", theme::dim()),
+                Span::styled(
+                    l.category.short_tag().to_string(),
+                    Style::default().fg(cat_color),
+                ),
+                Span::styled("  ", theme::dim()),
+                Span::styled(l.headline.clone(), headline_style),
+            ]))
+        })
+        .collect();
+
+    f.render_widget(List::new(items), inner);
+}
+
+/// Format a seconds offset as `+HH:MM:SS` for the landmarks pane.
+/// Compact and operator-friendly for cross-referencing against
+/// external logs that almost always use clock-style timestamps.
+fn fmt_offset_clock(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("+{h:02}:{m:02}:{s:02}")
+}
+
 fn render_help_overlay(f: &mut Frame, area: Rect, replay_mode: bool) {
-    let h = if replay_mode { 17 } else { 11 };
+    let h = if replay_mode { 18 } else { 11 };
     let w = 56.min(area.width.saturating_sub(4));
     let h = (h as u16).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
@@ -1360,6 +1475,10 @@ fn render_help_overlay(f: &mut Frame, area: Rect, replay_mode: bool) {
         body.push(Line::from("[  /  ]        seek back/forward 1 event"));
         body.push(Line::from("{  /  }        seek back/forward 10 events"));
         body.push(Line::from("← / →          seek 1 event (Shift = 10)"));
+        body.push(Line::from(Span::styled(
+            "n / p          next/prev landmark",
+            Style::default().fg(theme::WARN_FG),
+        )));
         body.push(Line::from("g / G          jump to start / end"));
         body.push(Line::from("Home / End     jump to start / end"));
     }

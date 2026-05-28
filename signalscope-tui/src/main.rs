@@ -20,6 +20,7 @@ use tracing::info;
 mod app;
 mod capture;
 mod inspect;
+mod landmarks;
 mod replay;
 mod theme;
 mod ui;
