@@ -108,14 +108,19 @@ the UI is shaped to mirror them:
   connected channel* rather than the global busiest, because the
   operational question is "how hostile is the airspace around my
   connection?" The header reads `connected ch44 · pressure: moderate
-  · density stable`; the body is a per-band channel-occupancy
-  histogram with the connected channel marked. Identity (SSID/BSSID)
-  rows are demoted behind a `d` toggle — modern macOS frequently
-  redacts them anyway, so occupancy is the more reliable layer.
-  Pressure is a coarse four-tier ladder
-  (`Low` / `Moderate` / `Elevated` / `Severe`) shared between analysis
-  (which fires `RfCongestion` from `Elevated` upward) and the panel
-  header (which surfaces every tier).
+  · density stable`. The body is a *flat, relevance-ranked* channel
+  occupancy histogram — no band grouping — with rows ordered:
+  connected channel → same-band channels (by proximity to connected)
+  → other-band channels (by AP count) → background (≤2 APs). Each row
+  carries its band annotation so context survives the flattening, and
+  the connected row is marked with a `▸` glyph + bold + `· connected`
+  suffix. This ordering keeps the connected-channel context onscreen
+  even when 2.4 GHz is dense. Identity (SSID/BSSID) rows are demoted
+  behind a `d` toggle — modern macOS frequently redacts them anyway,
+  so occupancy is the more reliable layer. Pressure is a coarse
+  four-tier ladder (`Low` / `Moderate` / `Elevated` / `Severe`) shared
+  between analysis (which fires `RfCongestion` from `Elevated` upward)
+  and the panel header (which surfaces every tier).
 
 That conceptual split also lives in `signalscope-analysis`. Two new
 windows in `analysis/windows.rs`:

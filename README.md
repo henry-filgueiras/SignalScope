@@ -25,9 +25,10 @@ architectural goal — see [`docs/architecture.md`](docs/architecture.md) and
   duration, a 60 s Δ RSSI callout, and a recent-RSSI sparkline.
 - **RF environment** panel anchored on the connected channel: header
   reads `connected ch44 · pressure: moderate · density stable`, body
-  is a per-band channel-occupancy histogram with the connected channel
-  highlighted, and the identity-oriented AP table is one `d` keypress
-  away when you want it
+  is a flat, relevance-ranked channel-occupancy histogram (connected
+  first → same-band neighbours by proximity → other bands by AP count
+  → background), each row band-annotated. The identity-oriented AP
+  table is one `d` keypress away when you want it
 - sensor-health surface — when Wi-Fi is off, redacted, or a backend is
   missing, the card shows the actual state instead of going silent
 - per-observation confidence tags (`Direct` / `Inferred` / `Estimated`

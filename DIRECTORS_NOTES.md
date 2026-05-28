@@ -109,10 +109,14 @@ SignalScope distinguishes two conceptual layers and the UI mirrors them:
   changes reset the duration counter.
 - **RF environment** — ambient AP activity treated as sparse and
   probabilistic. The panel is *anchored on the connected channel*: the
-  header line reads `connected ch44 · pressure: moderate · density
-  stable`, and the primary body is a per-band channel-occupancy
-  histogram with the connected channel marked. The individual-AP table
-  is demoted to a `d`-toggled detail view — modern macOS redacts SSIDs
+  header reads `connected ch44 · pressure: moderate · density
+  stable`. The body is a *flat, relevance-ranked* occupancy histogram
+  — no band grouping — ordered: connected channel → same-band channels
+  (by proximity to connected) → other-band channels (by AP count) →
+  background (≤2 APs). Each row carries its band annotation. This
+  keeps the connected channel onscreen even when 2.4 GHz is dense, and
+  remains coherent on small terminals. The individual-AP table is
+  demoted to a `d`-toggled detail view — modern macOS redacts SSIDs
   and BSSIDs anyway, so identity rows are low value. Pressure is a
   four-tier ladder (low / moderate / elevated / severe) computed from
   the AP count on the connected channel.
@@ -187,6 +191,73 @@ The TUI owns the terminal, so logs go to a rotating file under
 ---
 
 ## Resolved Dragons and Pivots
+
+### 2026-05-28 — Claude Opus 4.7 (flat relevance-ranked occupancy)
+
+**Demoted from Canon, verbatim:**
+
+> - **RF environment** — ambient AP activity treated as sparse and
+>   probabilistic. The panel is *anchored on the connected channel*: the
+>   header line reads `connected ch44 · pressure: moderate · density
+>   stable`, and the primary body is a per-band channel-occupancy
+>   histogram with the connected channel marked. The individual-AP table
+>   is demoted to a `d`-toggled detail view — modern macOS redacts SSIDs
+>   and BSSIDs anyway, so identity rows are low value. Pressure is a
+>   four-tier ladder (low / moderate / elevated / severe) computed from
+>   the AP count on the connected channel.
+
+(The same paragraph in `docs/architecture.md` was likewise replaced
+with the new flat-ordering framing.)
+
+**Problem.** The band-grouped histogram had a structural flaw: the
+2.4 GHz section (often dense — 1, 6, 11 all in use) consumed three
+high-up rows even when the operator was on 5 GHz or 6 GHz, pushing
+the *actually relevant* connected channel below the fold on smaller
+terminals. Operationally backwards.
+
+**Pivot.** Flatten the histogram into a single relevance-ranked list,
+keeping the connected channel as a hard anchor at the top regardless
+of which band is loudest.
+
+The ordering function (`ui::relevance_order`) ranks in four tiers:
+
+1. Connected channel — always row 1.
+2. Same-band-as-connected channels with AP count > 2 — sorted by
+   numeric distance to the connected channel (close overlap matters
+   more than far co-existence within band), tied by count desc.
+3. Other-band channels with AP count > 2 — sorted by count desc,
+   tied by channel number asc.
+4. Background channels (≤2 APs) — sorted by count desc.
+
+Each row carries its band as an annotation column (`   5 GHz`), so
+band context survives the flattening — the operator still sees that
+`ch11` is 2.4 GHz and `ch44` is 5 GHz without the header rows. The
+connected row gets a `▸` glyph, bold styling, and a `· connected`
+suffix.
+
+The `BandSort` helper and band-section headers are gone. When the
+panel overflows, the last visible row is a "X more · press 'd' for
+full AP list" hint instead of silent truncation.
+
+**Tests.** Six unit tests on `relevance_order` in the bin crate pin
+the priority: connected-always-first, same-band-beats-busier-other-
+band, same-band-orders-by-proximity, other-band-orders-by-count,
+background-pushed-to-bottom, unconnected-falls-back-to-busiest.
+
+**What this buys.**
+
+- Connected-channel context never gets buried by a noisy 2.4 GHz block.
+- The panel reads coherently on small terminals — 5–6 rows is enough
+  to surface the connected channel + 2–3 same-band siblings + 1–2
+  other-band highlights.
+- The visual feel shifts from "spectrum enumeration" toward "what
+  matters to *this* client right now."
+
+**Untouched.** Bus shape, lifecycle pipeline, gateway/DNS sensors,
+observation confidence, trend rules, macOS backend layering,
+pressure tier ladder, density trend, AP detail mode.
+
+`cargo test --workspace`: 36/36 green.
 
 ### 2026-05-28 — Claude Opus 4.7 (RF environment → occupancy instrument)
 

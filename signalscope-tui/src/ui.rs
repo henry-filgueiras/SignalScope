@@ -2,8 +2,6 @@
 //! mutation. Layouts recompute from the frame area on every draw, so resize
 //! is automatically supported.
 
-use std::collections::BTreeMap;
-
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
@@ -564,10 +562,11 @@ fn environmental_summary<'a>(
     Line::from(spans)
 }
 
-/// Primary visualization: per-band channel occupancy bars. The connected
-/// channel — if any — is marked with a trailing arrow so it remains the
-/// natural anchor for the eye. Bars are one block per AP, capped to keep
-/// the panel compact.
+/// Primary visualization: a single flat list of channels ordered by
+/// **relevance to the connected client**, not by band. The connected
+/// channel anchors the top so it never gets pushed offscreen by a busy
+/// 2.4 GHz band. Each row carries its own band annotation, so band
+/// context survives the flattening.
 fn render_occupancy_histogram(
     f: &mut Frame,
     area: Rect,
@@ -582,20 +581,8 @@ fn render_occupancy_histogram(
         return;
     }
 
-    // Channels with no band assignment are excluded from the histogram —
-    // they're rare and there's no good place to put them.
-    let mut by_band: BTreeMap<BandSort, BTreeMap<u16, usize>> = BTreeMap::new();
-    for ap in neighbors {
-        let Some(ch) = ap.channel else { continue };
-        by_band
-            .entry(BandSort::from(ch.band))
-            .or_default()
-            .entry(ch.number)
-            .and_modify(|n| *n += 1)
-            .or_insert(1);
-    }
-
-    if by_band.is_empty() {
+    let entries = collect_occupancy(neighbors);
+    if entries.is_empty() {
         f.render_widget(
             Paragraph::new("scan reports no channel data\npress 'd' for raw AP details")
                 .style(theme::dim())
@@ -605,71 +592,186 @@ fn render_occupancy_histogram(
         return;
     }
 
+    let ranked = relevance_order(&entries, connected_channel);
+
     const BAR_WIDTH: usize = 14;
-    let max_count = by_band
-        .values()
-        .flat_map(|m| m.values().copied())
-        .max()
-        .unwrap_or(1)
-        .max(1);
+    let max_count = ranked.iter().map(|e| e.count).max().unwrap_or(1).max(1);
+    let visible_rows = area.height as usize;
 
-    let mut lines: Vec<Line> = Vec::new();
-    for (band_sort, channels) in &by_band {
-        if !lines.is_empty() {
-            lines.push(Line::from(""));
+    let mut lines: Vec<Line> = Vec::with_capacity(visible_rows);
+    for (i, entry) in ranked.iter().enumerate() {
+        if i >= visible_rows {
+            break;
         }
-        lines.push(Line::from(Span::styled(
-            band_sort.label().to_string(),
-            Style::default().fg(theme::INFO_FG).add_modifier(Modifier::BOLD),
-        )));
-        for (ch, count) in channels {
-            let bar_units = ((*count * BAR_WIDTH) + max_count - 1) / max_count;
-            let bar: String = "█".repeat(bar_units.min(BAR_WIDTH));
-            let padding: String = " ".repeat(BAR_WIDTH.saturating_sub(bar_units));
-
-            let connected = connected_channel.is_some_and(|c| c.number == *ch);
-            let bar_color = if connected {
-                theme::TITLE_FG
-            } else {
-                bar_color_for_count(*count)
-            };
-            let mut spans = vec![
-                Span::styled(
-                    format!("  ch{:<4}", ch),
-                    if connected {
-                        Style::default().fg(theme::TITLE_FG).add_modifier(Modifier::BOLD)
-                    } else {
-                        theme::value()
-                    },
+        let last_visible = i + 1 == visible_rows && ranked.len() > visible_rows;
+        if last_visible {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  …  {} more · press 'd' for full AP list",
+                    ranked.len() - i
                 ),
-                Span::styled(bar, Style::default().fg(bar_color)),
-                Span::styled(padding, theme::dim()),
-                Span::styled(format!("  {:>2}", count), theme::value()),
-            ];
-            if connected {
-                spans.push(Span::styled(
-                    "  ← connected",
-                    Style::default().fg(theme::TITLE_FG),
-                ));
-            }
-            lines.push(Line::from(spans));
+                theme::dim(),
+            )));
+            break;
+        }
+        lines.push(occupancy_row(entry, max_count, BAR_WIDTH, connected_channel));
+    }
+
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OccupancyEntry {
+    channel: signalscope_events::Channel,
+    count: usize,
+}
+
+fn collect_occupancy(neighbors: &[NeighborAp]) -> Vec<OccupancyEntry> {
+    use std::collections::HashMap;
+    let mut by_channel: HashMap<u16, OccupancyEntry> = HashMap::new();
+    for ap in neighbors {
+        let Some(ch) = ap.channel else { continue };
+        by_channel
+            .entry(ch.number)
+            .and_modify(|e| e.count += 1)
+            .or_insert(OccupancyEntry {
+                channel: ch,
+                count: 1,
+            });
+    }
+    by_channel.into_values().collect()
+}
+
+/// Threshold below which an occupancy row is treated as "background" and
+/// pushed to the end of the list regardless of band.
+const BACKGROUND_COUNT_MAX: usize = 2;
+
+/// Rank channels for the panel. The brief's priority order:
+///
+/// 1. Connected channel — always on top.
+/// 2. Same-band-as-connected, AP count > 2 — sorted by distance to the
+///    connected channel (close overlap matters more than far co-existence).
+/// 3. Other-band channels with AP count > 2 — sorted by count desc.
+/// 4. Background (≤2 APs) — sorted by count desc to keep some signal
+///    among the noise.
+fn relevance_order(
+    entries: &[OccupancyEntry],
+    connected: Option<signalscope_events::Channel>,
+) -> Vec<OccupancyEntry> {
+    use std::cmp::Ordering;
+
+    let connected_num = connected.map(|c| c.number);
+    let connected_band = connected.map(|c| c.band);
+
+    let mut connected_row: Option<OccupancyEntry> = None;
+    let mut same_band: Vec<OccupancyEntry> = Vec::new();
+    let mut other_band: Vec<OccupancyEntry> = Vec::new();
+    let mut background: Vec<OccupancyEntry> = Vec::new();
+
+    for entry in entries {
+        let is_connected = connected_num == Some(entry.channel.number);
+        if is_connected {
+            connected_row = Some(*entry);
+            continue;
+        }
+        if entry.count <= BACKGROUND_COUNT_MAX {
+            background.push(*entry);
+            continue;
+        }
+        let same = connected_band.map_or(false, |b| entry.channel.band == b);
+        if same {
+            same_band.push(*entry);
+        } else {
+            other_band.push(*entry);
         }
     }
 
-    let total = lines.len();
-    let visible: Vec<Line> = lines.into_iter().take(area.height as usize).collect();
-    let truncated = total > visible.len();
-    let mut paragraph_lines = visible;
-    if truncated {
-        // Replace the last line with a truncation hint.
-        let last = paragraph_lines.pop();
-        let _ = last;
-        paragraph_lines.push(Line::from(Span::styled(
-            "  …  press 'd' for full AP list",
-            theme::dim(),
-        )));
+    if let Some(n) = connected_num {
+        same_band.sort_by(|a, b| {
+            let da = (a.channel.number as i32 - n as i32).abs();
+            let db = (b.channel.number as i32 - n as i32).abs();
+            match da.cmp(&db) {
+                Ordering::Equal => b.count.cmp(&a.count),
+                ord => ord,
+            }
+        });
+    } else {
+        same_band.sort_by(|a, b| b.count.cmp(&a.count));
     }
-    f.render_widget(Paragraph::new(paragraph_lines), area);
+    other_band.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then(a.channel.number.cmp(&b.channel.number))
+    });
+    background.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then(a.channel.number.cmp(&b.channel.number))
+    });
+
+    let mut out =
+        Vec::with_capacity(entries.len() + connected_row.is_some() as usize);
+    if let Some(c) = connected_row {
+        out.push(c);
+    }
+    out.extend(same_band);
+    out.extend(other_band);
+    out.extend(background);
+    out
+}
+
+fn occupancy_row(
+    entry: &OccupancyEntry,
+    max_count: usize,
+    bar_width: usize,
+    connected: Option<signalscope_events::Channel>,
+) -> Line<'static> {
+    let is_connected = connected.is_some_and(|c| c.number == entry.channel.number);
+    let bar_units = ((entry.count * bar_width) + max_count - 1) / max_count;
+    let bar: String = "█".repeat(bar_units.min(bar_width));
+    let padding: String = " ".repeat(bar_width.saturating_sub(bar_units));
+
+    let bar_color = if is_connected {
+        theme::TITLE_FG
+    } else {
+        bar_color_for_count(entry.count)
+    };
+    let band_label = match entry.channel.band {
+        BandClass::TwoPointFourGhz => "2.4 GHz",
+        BandClass::FiveGhz => "5 GHz",
+        BandClass::SixGhz => "6 GHz",
+        BandClass::Unknown => "—",
+    };
+
+    let marker = if is_connected { "▸" } else { " " };
+    let marker_style = if is_connected {
+        Style::default().fg(theme::TITLE_FG).add_modifier(Modifier::BOLD)
+    } else {
+        theme::dim()
+    };
+    let channel_style = if is_connected {
+        Style::default().fg(theme::TITLE_FG).add_modifier(Modifier::BOLD)
+    } else {
+        theme::value()
+    };
+
+    let mut spans = vec![
+        Span::styled(format!("{marker} "), marker_style),
+        Span::styled(format!("ch{:<5}", entry.channel.number), channel_style),
+        Span::styled(bar, Style::default().fg(bar_color)),
+        Span::styled(padding, theme::dim()),
+        Span::styled(format!("  {:>2} APs", entry.count), theme::value()),
+        Span::styled(format!("   {band_label:>7}"), theme::dim()),
+    ];
+    if is_connected {
+        spans.push(Span::styled(
+            "  · connected",
+            Style::default()
+                .fg(theme::TITLE_FG)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// Detail mode: the original neighbor table. Kept behind a 'd' toggle so
@@ -764,34 +866,6 @@ fn tier_color(tier: PressureTier) -> Color {
 
 fn bar_color_for_count(count: usize) -> Color {
     tier_color(pressure_tier(count))
-}
-
-/// Wrapper for ordered display of bands. The `BandClass` enum doesn't
-/// have a deterministic order beyond declaration; we want histogram
-/// sections to consistently read low → high.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct BandSort(u8);
-
-impl BandSort {
-    fn label(self) -> &'static str {
-        match self.0 {
-            0 => "2.4 GHz",
-            1 => "5 GHz",
-            2 => "6 GHz",
-            _ => "unknown band",
-        }
-    }
-}
-
-impl From<BandClass> for BandSort {
-    fn from(b: BandClass) -> Self {
-        BandSort(match b {
-            BandClass::TwoPointFourGhz => 0,
-            BandClass::FiveGhz => 1,
-            BandClass::SixGhz => 2,
-            BandClass::Unknown => 3,
-        })
-    }
 }
 
 fn render_findings(f: &mut Frame, area: Rect, state: &AppState) {
@@ -1036,4 +1110,103 @@ fn dns_fail_pct(samples: &[&DnsLatencyObservation]) -> f32 {
 
 fn sparkline_data<I: IntoIterator<Item = u64>>(values: I) -> Vec<u64> {
     values.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use signalscope_events::Channel;
+
+    fn ch(number: u16, band: BandClass) -> Channel {
+        Channel::new(number, band, None)
+    }
+
+    fn entry(number: u16, band: BandClass, count: usize) -> OccupancyEntry {
+        OccupancyEntry {
+            channel: ch(number, band),
+            count,
+        }
+    }
+
+    fn nums(ranked: &[OccupancyEntry]) -> Vec<u16> {
+        ranked.iter().map(|e| e.channel.number).collect()
+    }
+
+    #[test]
+    fn connected_channel_is_always_first() {
+        let entries = vec![
+            entry(11, BandClass::TwoPointFourGhz, 8), // globally busiest
+            entry(149, BandClass::FiveGhz, 4),        // connected
+            entry(6, BandClass::TwoPointFourGhz, 6),
+        ];
+        let connected = Some(ch(149, BandClass::FiveGhz));
+        let ranked = relevance_order(&entries, connected);
+        assert_eq!(nums(&ranked)[0], 149, "connected anchors the top");
+    }
+
+    #[test]
+    fn same_band_beats_other_band_even_when_other_band_is_busier() {
+        let entries = vec![
+            entry(11, BandClass::TwoPointFourGhz, 11), // very busy 2.4
+            entry(149, BandClass::FiveGhz, 5),         // connected
+            entry(36, BandClass::FiveGhz, 4),          // same-band sibling
+        ];
+        let connected = Some(ch(149, BandClass::FiveGhz));
+        let ranked = relevance_order(&entries, connected);
+        assert_eq!(nums(&ranked), vec![149, 36, 11]);
+    }
+
+    #[test]
+    fn same_band_orders_by_proximity_to_connected() {
+        let entries = vec![
+            entry(149, BandClass::FiveGhz, 6),
+            entry(36, BandClass::FiveGhz, 5),
+            entry(100, BandClass::FiveGhz, 5),
+            entry(157, BandClass::FiveGhz, 5),
+        ];
+        let connected = Some(ch(149, BandClass::FiveGhz));
+        let ranked = relevance_order(&entries, connected);
+        // Distances from 149: 157→8, 100→49, 36→113. So 157 first.
+        assert_eq!(nums(&ranked), vec![149, 157, 100, 36]);
+    }
+
+    #[test]
+    fn other_band_orders_by_count_desc() {
+        let entries = vec![
+            entry(149, BandClass::FiveGhz, 6), // connected
+            entry(11, BandClass::TwoPointFourGhz, 7),
+            entry(6, BandClass::TwoPointFourGhz, 10),
+            entry(1, BandClass::TwoPointFourGhz, 3),
+        ];
+        let connected = Some(ch(149, BandClass::FiveGhz));
+        let ranked = relevance_order(&entries, connected);
+        assert_eq!(nums(&ranked), vec![149, 6, 11, 1]);
+    }
+
+    #[test]
+    fn background_channels_get_pushed_to_the_bottom() {
+        let entries = vec![
+            entry(149, BandClass::FiveGhz, 6),
+            entry(36, BandClass::FiveGhz, 1), // background, same band
+            entry(11, BandClass::TwoPointFourGhz, 7), // interesting other band
+        ];
+        let connected = Some(ch(149, BandClass::FiveGhz));
+        let ranked = relevance_order(&entries, connected);
+        assert_eq!(
+            nums(&ranked),
+            vec![149, 11, 36],
+            "same-band background loses to other-band interesting"
+        );
+    }
+
+    #[test]
+    fn unconnected_falls_back_to_busiest_first() {
+        let entries = vec![
+            entry(11, BandClass::TwoPointFourGhz, 8),
+            entry(6, BandClass::TwoPointFourGhz, 12),
+            entry(149, BandClass::FiveGhz, 4),
+        ];
+        let ranked = relevance_order(&entries, None);
+        assert_eq!(nums(&ranked), vec![6, 11, 149]);
+    }
 }
