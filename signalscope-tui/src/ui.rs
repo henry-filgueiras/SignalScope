@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Wra
 use ratatui::Frame;
 use signalscope_events::{
     CorrelationFinding, DnsLatencyObservation, EventCategory, GatewayLatencyObservation,
-    NeighborAp, WifiObservation,
+    NeighborAp, ObservationConfidence, SensorHealth, SensorState, WifiObservation,
 };
 
 use crate::app::{AppState, FeedItem};
@@ -85,14 +85,19 @@ fn render_main(f: &mut Frame, area: Rect, state: &AppState) {
     let left = Layout::new(
         Direction::Vertical,
         [
-            Constraint::Length(8),
+            Constraint::Length(9),
             Constraint::Length(7),
             Constraint::Min(5),
         ],
     )
     .split(cols[0]);
 
-    render_wifi_card(f, left[0], state.latest_wifi.as_ref());
+    render_wifi_card(
+        f,
+        left[0],
+        state.latest_wifi.as_ref(),
+        state.health_for("wifi"),
+    );
     render_gateway_card(f, left[1], state);
     render_dns_card(f, left[2], state);
 
@@ -112,26 +117,72 @@ fn render_main(f: &mut Frame, area: Rect, state: &AppState) {
     render_findings(f, right[1], state);
 }
 
-fn render_wifi_card(f: &mut Frame, area: Rect, wifi: Option<&WifiObservation>) {
-    let block = card_block("Wi-Fi link");
+fn render_wifi_card(
+    f: &mut Frame,
+    area: Rect,
+    wifi: Option<&WifiObservation>,
+    health: Option<&SensorHealth>,
+) {
+    let title = wifi_card_title(health);
+    let block = card_block(&title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // Health banner sits above the data block when something is wrong.
+    let status_line = wifi_status_banner(health);
+
+    let layout = if status_line.is_some() {
+        Layout::new(
+            Direction::Vertical,
+            [Constraint::Length(1), Constraint::Min(1)],
+        )
+        .split(inner)
+    } else {
+        Layout::new(Direction::Vertical, [Constraint::Min(1)]).split(inner)
+    };
+
+    let body_area = if let Some(line) = status_line {
+        f.render_widget(Paragraph::new(line), layout[0]);
+        layout[1]
+    } else {
+        layout[0]
+    };
+
     let Some(w) = wifi else {
-        f.render_widget(
-            Paragraph::new("no data — awaiting first observation")
-                .style(theme::dim()),
-            inner,
-        );
+        let msg = match health.map(|h| h.state) {
+            Some(SensorState::BackendUnavailable) => {
+                "no Wi-Fi backend available on this host"
+            }
+            Some(SensorState::HardwareDisabled) => "Wi-Fi is off",
+            Some(SensorState::PermissionDenied) => "permission required to read Wi-Fi state",
+            _ => "no data — awaiting first observation",
+        };
+        f.render_widget(Paragraph::new(msg).style(theme::dim()), body_area);
         return;
     };
 
-    let ssid = w
+    let confidence_marker = match w.confidence {
+        ObservationConfidence::Direct => Span::raw(""),
+        ObservationConfidence::Inferred => Span::styled(
+            "  (redacted source)",
+            Style::default().fg(theme::WARN_FG),
+        ),
+        ObservationConfidence::Estimated => Span::styled(
+            "  (estimated)",
+            Style::default().fg(theme::WARN_FG),
+        ),
+        ObservationConfidence::Stale => Span::styled(
+            "  (stale)",
+            Style::default().fg(theme::BAD_FG),
+        ),
+    };
+
+    let ssid_display = w
         .ssid
         .as_ref()
         .map(|s| s.as_str().to_string())
-        .unwrap_or_else(|| "<unassociated>".into());
-    let bssid = w
+        .unwrap_or_else(|| "<redacted>".into());
+    let bssid_display = w
         .bssid
         .as_ref()
         .map(|b| b.as_str().to_string())
@@ -148,39 +199,25 @@ fn render_wifi_card(f: &mut Frame, area: Rect, wifi: Option<&WifiObservation>) {
         .snr_db()
         .map(|s| format!("{s} dB"))
         .unwrap_or_else(|| "—".into());
-    let chan_str = w
-        .channel
-        .map(|c| {
-            let width = match c.width {
-                Some(signalscope_events::ChannelWidth::Mhz20) => "20",
-                Some(signalscope_events::ChannelWidth::Mhz40) => "40",
-                Some(signalscope_events::ChannelWidth::Mhz80) => "80",
-                Some(signalscope_events::ChannelWidth::Mhz160) => "160",
-                Some(signalscope_events::ChannelWidth::Mhz80Plus80) => "80+80",
-                None => "?",
-            };
-            let band = match c.band {
-                signalscope_events::BandClass::TwoPointFourGhz => "2.4 GHz",
-                signalscope_events::BandClass::FiveGhz => "5 GHz",
-                signalscope_events::BandClass::SixGhz => "6 GHz",
-                signalscope_events::BandClass::Unknown => "?",
-            };
-            format!("{} · {} MHz · {band}", c.number, width)
-        })
-        .unwrap_or_else(|| "—".into());
+    let chan_str = w.channel.map(channel_display).unwrap_or_else(|| "—".into());
+    let phy_str = w.phy_mode.clone().unwrap_or_else(|| "—".into());
 
-    let rssi_goodness = w
-        .rssi_dbm
-        .map(rssi_goodness)
-        .unwrap_or(0.5);
-    let rssi_color = theme::quality_color(rssi_goodness);
+    let rssi_goodness_val = w.rssi_dbm.map(rssi_goodness).unwrap_or(0.5);
+    let rssi_color = theme::quality_color(rssi_goodness_val);
 
     let lines = vec![
-        kv("SSID", ssid),
-        kv("BSSID", bssid),
+        Line::from(vec![
+            label("SSID"),
+            Span::styled(ssid_display, theme::value()),
+            confidence_marker,
+        ]),
+        kv("BSSID", bssid_display),
         Line::from(vec![
             label("RSSI"),
-            Span::styled(rssi_str, Style::default().fg(rssi_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                rssi_str,
+                Style::default().fg(rssi_color).add_modifier(Modifier::BOLD),
+            ),
             Span::raw("    "),
             label("Noise"),
             Span::styled(noise_str, theme::value()),
@@ -188,10 +225,76 @@ fn render_wifi_card(f: &mut Frame, area: Rect, wifi: Option<&WifiObservation>) {
             label("SNR"),
             Span::styled(snr_str, theme::value()),
         ]),
-        kv("Channel", chan_str),
+        Line::from(vec![
+            label("Channel"),
+            Span::styled(chan_str, theme::value()),
+            Span::raw("    "),
+            label("PHY"),
+            Span::styled(phy_str, theme::value()),
+        ]),
     ];
 
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(Paragraph::new(lines), body_area);
+}
+
+fn wifi_card_title(health: Option<&SensorHealth>) -> String {
+    match health {
+        Some(h) => {
+            let backend = h.backend.as_deref().unwrap_or("—");
+            match h.state {
+                SensorState::Operational => format!("Wi-Fi link · {backend}"),
+                SensorState::BackendUnavailable => "Wi-Fi link · backend unavailable".to_string(),
+                SensorState::HardwareDisabled => format!("Wi-Fi link · {backend} · off"),
+                SensorState::PermissionDenied => {
+                    format!("Wi-Fi link · {backend} · permission denied")
+                }
+                SensorState::ParseFailed => format!("Wi-Fi link · {backend} · parse failed"),
+                SensorState::Stale => format!("Wi-Fi link · {backend} · stale"),
+            }
+        }
+        None => "Wi-Fi link".to_string(),
+    }
+}
+
+/// Returns a one-line summary banner when the sensor is in a non-operational
+/// state. Operational sensors get no banner — the card just shows data.
+fn wifi_status_banner<'a>(health: Option<&'a SensorHealth>) -> Option<Line<'a>> {
+    let h = health?;
+    if h.state == SensorState::Operational {
+        return None;
+    }
+    let color = match h.state {
+        SensorState::Stale => theme::WARN_FG,
+        SensorState::PermissionDenied | SensorState::HardwareDisabled => theme::WARN_FG,
+        _ => theme::BAD_FG,
+    };
+    let mut spans = vec![Span::styled(
+        format!("⚠ {:?}", h.state),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )];
+    if let Some(detail) = h.detail.as_deref() {
+        spans.push(Span::raw(" — "));
+        spans.push(Span::styled(detail.to_string(), theme::dim()));
+    }
+    Some(Line::from(spans))
+}
+
+fn channel_display(c: signalscope_events::Channel) -> String {
+    let width = match c.width {
+        Some(signalscope_events::ChannelWidth::Mhz20) => "20",
+        Some(signalscope_events::ChannelWidth::Mhz40) => "40",
+        Some(signalscope_events::ChannelWidth::Mhz80) => "80",
+        Some(signalscope_events::ChannelWidth::Mhz160) => "160",
+        Some(signalscope_events::ChannelWidth::Mhz80Plus80) => "80+80",
+        None => "?",
+    };
+    let band = match c.band {
+        signalscope_events::BandClass::TwoPointFourGhz => "2.4 GHz",
+        signalscope_events::BandClass::FiveGhz => "5 GHz",
+        signalscope_events::BandClass::SixGhz => "6 GHz",
+        signalscope_events::BandClass::Unknown => "?",
+    };
+    format!("{} · {} MHz · {band}", c.number, width)
 }
 
 fn render_gateway_card(f: &mut Frame, area: Rect, state: &AppState) {
@@ -327,7 +430,14 @@ fn render_neighbors(
     f.render_widget(block, area);
 
     let mut sorted: Vec<&NeighborAp> = neighbors.iter().collect();
-    sorted.sort_by(|a, b| b.rssi_dbm.cmp(&a.rssi_dbm));
+    // Sort by RSSI descending. Entries without an RSSI fall to the bottom —
+    // they're still useful for density analysis but not for ranking.
+    sorted.sort_by(|a, b| match (a.rssi_dbm, b.rssi_dbm) {
+        (Some(x), Some(y)) => y.cmp(&x),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
 
     let current_bssid = current.and_then(|w| w.bssid.as_ref());
 
@@ -335,35 +445,43 @@ fn render_neighbors(
         .iter()
         .take(inner.height as usize)
         .map(|ap| {
-            let is_current = Some(&ap.bssid) == current_bssid;
+            let is_current = ap.bssid.as_ref().zip(current_bssid).map_or(false, |(a, b)| a == b);
             let marker = if is_current { "● " } else { "  " };
             let ssid = ap
                 .ssid
                 .as_ref()
                 .map(|s| s.as_str().to_string())
-                .unwrap_or_else(|| "<hidden>".into());
+                .unwrap_or_else(|| "<redacted>".into());
             let ssid_trunc: String = ssid.chars().take(16).collect();
             let channel = ap
                 .channel
                 .map(|c| format!("{:>3}", c.number))
                 .unwrap_or_else(|| "  -".into());
-            let color = theme::quality_color(rssi_goodness(ap.rssi_dbm));
-            let style = if is_current {
-                Style::default()
+            let bssid_display = ap
+                .bssid
+                .as_ref()
+                .map(|b| b.as_str().to_string())
+                .unwrap_or_else(|| "—".into());
+            let (rssi_text, rssi_color) = match ap.rssi_dbm {
+                Some(r) => (format!("{:>4} dBm", r), theme::quality_color(rssi_goodness(r))),
+                None => ("   —    ".to_string(), theme::DIM_FG),
+            };
+            let ssid_style = match (is_current, ap.confidence) {
+                (true, _) => Style::default()
                     .fg(theme::TITLE_FG)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                theme::value()
+                    .add_modifier(Modifier::BOLD),
+                (_, ObservationConfidence::Direct) => theme::value(),
+                _ => theme::dim(),
             };
             ListItem::new(Line::from(vec![
                 Span::styled(marker, Style::default().fg(theme::INFO_FG)),
-                Span::styled(format!("{:<16}", ssid_trunc), style),
+                Span::styled(format!("{:<16}", ssid_trunc), ssid_style),
                 Span::raw(" "),
-                Span::styled(format!("{}", ap.bssid), theme::dim()),
+                Span::styled(format!("{:<17}", bssid_display), theme::dim()),
                 Span::raw(" ch"),
                 Span::styled(channel, theme::value()),
                 Span::raw(" "),
-                Span::styled(format!("{:>4} dBm", ap.rssi_dbm), Style::default().fg(color)),
+                Span::styled(rssi_text, Style::default().fg(rssi_color)),
             ]))
         })
         .collect();
@@ -494,6 +612,7 @@ fn feed_item_row(item: &FeedItem) -> ListItem<'_> {
         EventCategory::Interface => theme::WARN_FG,
         EventCategory::Roam => theme::WARN_FG,
         EventCategory::Finding => theme::BAD_FG,
+        EventCategory::Health => theme::WARN_FG,
     };
     // HH:MM:SS in UTC. We don't know the user's TZ portably without an extra
     // dep; the priority is relative ordering, not local-time pretty-printing.

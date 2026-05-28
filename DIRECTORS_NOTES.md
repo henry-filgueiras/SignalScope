@@ -24,7 +24,9 @@ A Cargo workspace with five crates:
 - `signalscope-core` — append-only in-memory event bus (broadcast +
   bounded backlog), clock abstraction, tracing setup.
 - `signalscope-sensors` — `Sensor` trait + per-source adapters. Currently:
-  Wi-Fi (macOS `airport`), gateway (`ping`), DNS (`hickory-resolver`).
+  Wi-Fi (macOS, primary backend `system_profiler -xml SPAirPortDataType`,
+  legacy `airport` retained as a fallback for pre-Sonoma hosts), gateway
+  (`ping`), DNS (`hickory-resolver`).
 - `signalscope-analysis` — rolling windows over the event stream + a
   handful of confidence-scored correlation rules.
 - `signalscope-tui` — ratatui dashboard, binary `signalscope`.
@@ -58,6 +60,48 @@ Findings carry `kind`, `headline`, `Confidence` in `0.0..=1.0`, and
 `evidence`. Rules are intentionally cautious hand-tuned heuristics — never
 "the system says X". The TUI shows confidence so the operator can judge.
 
+### Observation epistemics
+
+Every observation carries an `ObservationConfidence` tag — `Direct`,
+`Inferred`, `Estimated`, or `Stale`. The point is honesty about *how*
+something was learned. Examples:
+
+- macOS without Location Services redacts SSIDs and omits BSSIDs; we
+  surface those observations as `Inferred`, not `Direct`.
+- A neighbor without RSSI is still useful for density counting; it ships
+  as `Inferred`.
+
+Renderers can downgrade colors / labels when confidence is anything but
+`Direct`. Analysis is free to weight by confidence in the future; today
+it only filters out neighbors lacking required fields.
+
+### Degraded-state semantics
+
+Sensors emit `SensorHealth` events on state transitions:
+`Operational`, `BackendUnavailable`, `HardwareDisabled`,
+`PermissionDenied`, `ParseFailed`, `Stale`. The dashboard reads the
+latest health per sensor and reflects it (e.g. Wi-Fi card title shows
+the backend, banner shows the state when not `Operational`). Health
+events are deliberately *not* synthesized observations — a missing
+sensor stays silent on the data plane and loud on the health plane.
+
+### Wi-Fi backend layering (macOS)
+
+Inside `signalscope-sensors/src/wifi/macos/` the sensor picks one
+acquisition backend at startup and sticks with it:
+
+1. `system_profiler -xml SPAirPortDataType` — primary. Works on every
+   modern macOS, no root, but modern privacy surfaces SSIDs as
+   `<redacted>` and omits BSSIDs unless Location Services is granted to
+   the invoking process.
+2. `airport -I` / `airport -s` — legacy. Only picked if the binary
+   exists, which it doesn't on macOS 14.4+.
+
+Backend selection is an implementation detail; analysis and the TUI
+only see normalized `WifiObservation` / `NeighborAp` / `SensorHealth`.
+The TUI's Wi-Fi card title surfaces the active backend so the operator
+can tell, but no code path outside `wifi/macos/` branches on it.
+
 ### Phase 1 scope
 
 In: Wi-Fi link + scan, gateway probe, DNS probe, lightweight correlation,
@@ -79,15 +123,78 @@ The TUI owns the terminal, so logs go to a rotating file under
 
 ### Open questions
 
-- Replace `airport`-based macOS Wi-Fi adapter (binary removed in macOS
-  14.4+). `system_profiler -xml SPAirPortDataType` is the likely path.
 - Replace `ping(8)` subprocess with a `socket2`-based ICMP/UDP probe to
   shed the per-tick fork+exec cost.
 - Decide when persistence is justified (JSONL first, SQLite later).
+- Decide whether to ship a Location-Services-aware setup path on macOS
+  so the operator can see real SSIDs/BSSIDs when desired. Today they
+  enable LS for Terminal manually; SignalScope's only job is to be
+  honest about the redaction when it happens.
+- First Linux backend choice: `iw dev <iface> link` shell-out vs. raw
+  `nl80211` netlink. Lean toward `nl80211` for the same reason we
+  preferred `system_profiler` over `airport` on macOS — first-party,
+  no privilege escalation, no shell parsing.
 
 ---
 
 ## Resolved Dragons and Pivots
+
+### 2026-05-28 — Claude Opus 4.7 (Wi-Fi backend pivot)
+
+**Demoted from Canon, verbatim:**
+
+> `signalscope-sensors` — `Sensor` trait + per-source adapters. Currently:
+> Wi-Fi (macOS `airport`), gateway (`ping`), DNS (`hickory-resolver`).
+
+> - Replace `airport`-based macOS Wi-Fi adapter (binary removed in macOS
+>   14.4+). `system_profiler -xml SPAirPortDataType` is the likely path.
+
+**What changed.** Replaced the single-binary `airport`-only Wi-Fi
+adapter with a layered backend system under `wifi/macos/`:
+
+- `WifiBackend` enum chosen at sensor startup: `SystemProfiler` first,
+  `Airport` only if its binary still exists. Selection is logged once,
+  never re-evaluated, never branched on outside this module.
+- `system_profiler -xml SPAirPortDataType` parsed via the `plist` crate.
+  Handles modern macOS realities the airport parser couldn't: SSID
+  `<redacted>`, missing BSSID, missing neighbor RSSI, the actual Apple
+  typo `pairport_security_mode_wpa3_transition` (no leading `s`), and
+  the 6 GHz / Wi-Fi 6E channel format `"37 (6GHz, 160MHz)"`.
+
+**Event model changes.** Three new things in `signalscope-events`:
+
+- `ObservationConfidence { Direct, Inferred, Estimated, Stale }`,
+  attached to `WifiObservation` and `NeighborAp`. Lets us be honest
+  about redaction without inventing values.
+- `NeighborAp::bssid` and `NeighborAp::rssi_dbm` are now `Option`. The
+  field changes ripple to one place (sticky-client rule); analysis
+  silently drops entries that lack the fields it needs.
+- New `Event::SensorHealth` variant carrying
+  `SensorState { Operational, BackendUnavailable, HardwareDisabled,
+  PermissionDenied, ParseFailed, Stale }`, a backend name, and a free
+  detail string. Sensors only publish on transition — no per-tick
+  health spam.
+
+**TUI changes.** Wi-Fi card title shows the active backend; an
+inline warning banner shows the state when not `Operational`; the SSID
+line displays `<redacted>` in a dim warning style and surfaces the
+`Inferred` confidence tag. Neighbor list handles `None` RSSI by
+sorting to the bottom with a dash; `None` BSSID renders as `—`.
+
+**Fixture-driven parser.** Four fixtures under
+`examples/fixtures/wifi/`: `associated` (Location Services granted),
+`redacted` (modern default), `no_association`, `wifi_off`. All
+synthetic SSIDs/BSSIDs. Six parser tests pin behavior so Apple output
+drift doesn't silently degrade the dashboard.
+
+**Cadence.** Single conservative interval of 10 s for the Wi-Fi
+snapshot — `system_profiler` takes 1–2 s and we don't want it dominating
+the runtime. Gateway and DNS cadences are unchanged.
+
+`cargo test --workspace` runs 10 tests green; the bootstrap caveat from
+the earlier entry that Wi-Fi data wouldn't populate on modern macOS is
+now resolved at the architecture level (subject to Location Services
+for non-redacted identifiers).
 
 ### 2026-05-28 — Claude Opus 4.7 (run script)
 

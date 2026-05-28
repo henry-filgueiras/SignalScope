@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+	<dict>
+		<key>_dataType</key>
+		<string>SPAirPortDataType</string>
+		<key>_items</key>
+		<array>
+			<dict>
+				<key>spairport_airport_interfaces</key>
+				<array>
+					<dict>
+						<key>_name</key>
+						<string>en0</string>
+						<key>spairport_current_network_information</key>
+						<dict>
+							<key>_name</key>
+							<string>&lt;redacted&gt;</string>
+							<key>spairport_network_channel</key>
+							<string>149 (5GHz, 80MHz)</string>
+							<key>spairport_network_country_code</key>
+							<string>US</string>
+							<key>spairport_network_mcs</key>
+							<integer>9</integer>
+							<key>spairport_network_phymode</key>
+							<string>802.11ax</string>
+							<key>spairport_network_rate</key>
+							<integer>960</integer>
+							<key>spairport_network_type</key>
+							<string>spairport_network_type_station</string>
+							<key>spairport_security_mode</key>
+							<string>spairport_security_mode_wpa2_personal</string>
+							<key>spairport_signal_noise</key>
+							<string>-58 dBm / -97 dBm</string>
+						</dict>
+						<key>spairport_status_information</key>
+						<string>spairport_status_connected</string>
+						<key>spairport_airport_other_local_wireless_networks</key>
+						<array>
+							<dict>
+								<key>_name</key>
+								<string>&lt;redacted&gt;</string>
+								<key>spairport_network_channel</key>
+								<string>1 (2GHz, 20MHz)</string>
+								<key>spairport_network_phymode</key>
+								<string>802.11b/g/n/ac/ax</string>
+								<key>spairport_network_type</key>
+								<string>spairport_network_type_station</string>
+								<key>spairport_security_mode</key>
+								<string>spairport_security_mode_wpa2_personal</string>
+							</dict>
+							<dict>
+								<key>_name</key>
+								<string>&lt;redacted&gt;</string>
+								<key>spairport_network_channel</key>
+								<string>6 (2GHz, 20MHz)</string>
+								<key>spairport_network_phymode</key>
+								<string>802.11b/g/n</string>
+								<key>spairport_network_type</key>
+								<string>spairport_network_type_station</string>
+								<key>spairport_security_mode</key>
+								<string>spairport_security_mode_wpa2_personal_mixed</string>
+							</dict>
+							<dict>
+								<key>_name</key>
+								<string>&lt;redacted&gt;</string>
+								<key>spairport_network_channel</key>
+								<string>44 (5GHz, 80MHz)</string>
+								<key>spairport_network_phymode</key>
+								<string>802.11a/n/ac/ax</string>
+								<key>spairport_network_type</key>
+								<string>spairport_network_type_station</string>
+								<key>spairport_security_mode</key>
+								<string>pairport_security_mode_wpa3_transition</string>
+							</dict>
+							<dict>
+								<key>_name</key>
+								<string>&lt;redacted&gt;</string>
+								<key>spairport_network_channel</key>
+								<string>149 (5GHz, 80MHz)</string>
+								<key>spairport_network_phymode</key>
+								<string>802.11ax</string>
+								<key>spairport_network_type</key>
+								<string>spairport_network_type_station</string>
+								<key>spairport_security_mode</key>
+								<string>spairport_security_mode_wpa3_personal</string>
+								<key>spairport_signal_noise</key>
+								<string>-71 dBm / -97 dBm</string>
+							</dict>
+						</array>
+						<key>spairport_wireless_mac_address</key>
+						<string>22:33:44:55:66:77</string>
+					</dict>
+				</array>
+			</dict>
+		</array>
+	</dict>
+</array>
+</plist>

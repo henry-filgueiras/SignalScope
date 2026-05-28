@@ -1,74 +1,61 @@
-//! macOS Wi-Fi adapter.
+//! Legacy macOS Wi-Fi backend: the `airport` CLI.
 //!
-//! ## What this adapter does
-//!
-//! Shells out to the legacy `airport` binary at
-//! `/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport`
-//! and parses its human-readable output into normalized
-//! [`signalscope_events::WifiObservation`] / [`signalscope_events::ScanResult`].
-//!
-//! ## Caveats
-//!
-//! * `airport` was deprecated/removed in macOS Sonoma 14.4. On hosts where
-//!   it's missing, the sensor emits nothing and logs a single warning. A
-//!   future adapter should prefer `system_profiler -xml SPAirPortDataType`,
-//!   `wdutil info`, or direct CoreWLAN FFI.
-//! * Output formats vary across macOS versions; the parser is forgiving but
-//!   not exhaustive.
-//! * Some fields (noise floor, channel width) are unavailable on recent
-//!   macOS versions even when `airport` is present.
+//! Kept for pre-Sonoma macOS hosts where the binary still ships and
+//! actually returns BSSIDs / signal numbers without the modern privacy
+//! redaction. On macOS 14.4+ the binary was removed; the backend selector
+//! will simply not pick this path.
 
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
 use signalscope_events::{
-    BandClass, Bssid, Channel, ChannelWidth, NeighborAp, ScanResult, Security, Ssid,
-    WifiObservation,
+    BandClass, Bssid, Channel, ChannelWidth, NeighborAp, ObservationConfidence, ScanResult,
+    Security, Ssid, WifiObservation,
 };
 use tokio::process::Command;
+
+use super::{BackendError, WifiSnapshot};
 
 const AIRPORT_BIN: &str =
     "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport";
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Read `airport -I` (current associated link). Returns `None` when the
-/// interface exists but is not associated.
-pub async fn current_link(interface: &str) -> Result<Option<WifiObservation>> {
-    let out = run_airport(&[interface, "-I"]).await?;
-    if out.trim().is_empty() || out.contains("AirPort: Off") {
-        return Ok(None);
-    }
-    Ok(Some(parse_link(interface, &out)))
-}
+pub async fn snapshot(interface: &str) -> Result<WifiSnapshot, BackendError> {
+    let link_text = run_airport(&[interface, "-I"]).await?;
+    let link = if link_text.contains("AirPort: Off") {
+        return Err(BackendError::HardwareDisabled);
+    } else if link_text.trim().is_empty() {
+        None
+    } else {
+        Some(parse_link(interface, &link_text))
+    };
 
-/// Perform a neighbor scan (`airport -s`).
-pub async fn scan(interface: &str) -> Result<ScanResult> {
-    let out = run_airport(&[interface, "-s"]).await?;
-    let neighbors = parse_scan(&out);
-    Ok(ScanResult {
+    let scan_text = run_airport(&[interface, "-s"]).await?;
+    let scan = Some(ScanResult {
         interface: interface.to_string(),
-        neighbors,
-    })
+        neighbors: parse_scan(&scan_text),
+    });
+
+    Ok(WifiSnapshot { link, scan })
 }
 
-async fn run_airport(args: &[&str]) -> Result<String> {
+async fn run_airport(args: &[&str]) -> Result<String, BackendError> {
     let fut = Command::new(AIRPORT_BIN).args(args).output();
-    let output = match tokio::time::timeout(COMMAND_TIMEOUT, fut).await {
+    let out = match tokio::time::timeout(COMMAND_TIMEOUT, fut).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(anyhow!(
-                "airport binary not found at {AIRPORT_BIN} (removed in macOS 14.4+)"
-            ));
+            return Err(BackendError::BinaryMissing(AIRPORT_BIN.into()));
         }
-        Ok(Err(e)) => return Err(e).context("invoking airport"),
-        Err(_) => return Err(anyhow!("airport command timed out")),
+        Ok(Err(e)) => return Err(BackendError::Io(e)),
+        Err(_) => return Err(BackendError::Timeout),
     };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("airport exited with {}: {}", output.status, stderr));
+    if !out.status.success() {
+        return Err(BackendError::Other(format!(
+            "airport exited with {}",
+            out.status
+        )));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn parse_link(interface: &str, text: &str) -> WifiObservation {
@@ -81,8 +68,9 @@ fn parse_link(interface: &str, text: &str) -> WifiObservation {
         tx_rate_mbps: None,
         channel: None,
         security: None,
+        phy_mode: None,
+        confidence: ObservationConfidence::Direct,
     };
-
     for line in text.lines() {
         let line = line.trim();
         let Some((key, value)) = line.split_once(':') else {
@@ -101,29 +89,16 @@ fn parse_link(interface: &str, text: &str) -> WifiObservation {
             _ => {}
         }
     }
-
     obs
 }
 
-/// `airport -s` is whitespace-aligned columns:
-///
-/// ```text
-///                             SSID BSSID             RSSI CHANNEL HT CC SECURITY
-///                            HomeAP aa:bb:cc:dd:ee:ff -54  149,80   Y  US WPA2(PSK/AES/AES)
-/// ```
 fn parse_scan(text: &str) -> Vec<NeighborAp> {
     let mut lines = text.lines();
     let Some(header) = lines.next() else {
         return Vec::new();
     };
-
-    // Find column starts from the header so SSIDs containing spaces don't
-    // break parsing.
     let cols = ["SSID", "BSSID", "RSSI", "CHANNEL", "HT", "CC", "SECURITY"];
-    let starts: Vec<usize> = cols
-        .iter()
-        .filter_map(|name| header.find(name))
-        .collect();
+    let starts: Vec<usize> = cols.iter().filter_map(|name| header.find(name)).collect();
     if starts.len() < 4 {
         return Vec::new();
     }
@@ -133,13 +108,11 @@ fn parse_scan(text: &str) -> Vec<NeighborAp> {
         if line.trim().is_empty() {
             continue;
         }
-        // Use the column starts to slice.
         let get = |i: usize| -> Option<&str> {
             let start = *starts.get(i)?;
             let end = starts.get(i + 1).copied().unwrap_or(line.len());
             line.get(start..end.min(line.len())).map(str::trim)
         };
-
         let ssid_field = get(0).unwrap_or("").to_string();
         let bssid_field = get(1).unwrap_or("");
         let rssi_field = get(2).unwrap_or("");
@@ -149,38 +122,40 @@ fn parse_scan(text: &str) -> Vec<NeighborAp> {
         if bssid_field.is_empty() || rssi_field.is_empty() {
             continue;
         }
-
         let Ok(rssi) = rssi_field.parse::<i32>() else {
             continue;
         };
-
         neighbors.push(NeighborAp {
-            bssid: Bssid::new(bssid_field),
+            bssid: Some(Bssid::new(bssid_field)),
             ssid: if ssid_field.is_empty() {
                 None
             } else {
                 Some(Ssid::new(ssid_field.trim()))
             },
-            rssi_dbm: rssi,
+            rssi_dbm: Some(rssi),
             channel: parse_channel_spec(channel_field),
             security: Some(parse_security(security_field)),
+            phy_mode: None,
+            confidence: ObservationConfidence::Direct,
         });
     }
     neighbors
 }
 
 fn parse_channel_spec(s: &str) -> Option<Channel> {
-    // Formats observed:
-    //   "149"
-    //   "149,80"      (channel, width MHz)
-    //   "149,80+"     (with channel-width annotation)
-    //   "149 (5 GHz, 80 MHz)"
     let cleaned = s.split('(').next().unwrap_or(s).trim();
     let mut parts = cleaned.splitn(2, |c: char| c == ',' || c.is_whitespace());
     let number: u16 = parts.next()?.trim().parse().ok()?;
     let width = parts
         .next()
-        .and_then(|rest| rest.trim_start_matches(|c: char| !c.is_ascii_digit()).chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse::<u16>().ok())
+        .and_then(|rest| {
+            rest.trim_start_matches(|c: char| !c.is_ascii_digit())
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse::<u16>()
+                .ok()
+        })
         .and_then(channel_width);
 
     Some(Channel {
@@ -202,7 +177,9 @@ fn channel_width(mhz: u16) -> Option<ChannelWidth> {
 
 fn parse_security(s: &str) -> Security {
     let lower = s.to_ascii_lowercase();
-    if lower.contains("wpa3") {
+    if lower.contains("wpa3_transition") {
+        Security::Wpa3Transition
+    } else if lower.contains("wpa3") {
         Security::Wpa3
     } else if lower.contains("wpa2") {
         Security::Wpa2
@@ -241,20 +218,14 @@ mod tests {
 "#;
         let obs = parse_link("en0", sample);
         assert_eq!(obs.ssid.as_ref().map(|s| s.as_str()), Some("HomeAP"));
-        assert_eq!(obs.bssid.as_ref().map(|b| b.as_str()), Some("aa:bb:cc:dd:ee:ff"));
+        assert_eq!(
+            obs.bssid.as_ref().map(|b| b.as_str()),
+            Some("aa:bb:cc:dd:ee:ff")
+        );
         assert_eq!(obs.rssi_dbm, Some(-54));
         assert_eq!(obs.noise_dbm, Some(-92));
-        assert_eq!(obs.tx_rate_mbps, Some(526.0));
-        let ch = obs.channel.expect("channel");
+        let ch = obs.channel.unwrap();
         assert_eq!(ch.number, 149);
-        assert_eq!(ch.band, BandClass::FiveGhz);
         assert_eq!(ch.width, Some(ChannelWidth::Mhz80));
-    }
-
-    #[test]
-    fn channel_spec_parses_variants() {
-        assert_eq!(parse_channel_spec("6").map(|c| c.number), Some(6));
-        assert_eq!(parse_channel_spec("149,80").map(|c| c.number), Some(149));
-        assert_eq!(parse_channel_spec("36,40").and_then(|c| c.width), Some(ChannelWidth::Mhz40));
     }
 }

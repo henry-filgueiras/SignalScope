@@ -20,7 +20,7 @@ use ratatui::Terminal;
 use signalscope_core::EventBus;
 use signalscope_events::{
     CorrelationFinding, DnsLatencyObservation, Envelope, Event, FindingKind,
-    GatewayLatencyObservation, ScanResult, WifiObservation,
+    GatewayLatencyObservation, ScanResult, SensorHealth, SensorId, WifiObservation,
 };
 use tokio::time::interval;
 use tracing::warn;
@@ -174,6 +174,7 @@ pub struct AppState {
     pub gateway_history: VecDeque<GatewayLatencyObservation>,
     pub dns_history: VecDeque<DnsLatencyObservation>,
     pub findings: HashMap<FindingKind, (Instant, CorrelationFinding)>,
+    pub sensor_health: HashMap<SensorId, SensorHealth>,
     pub event_feed: VecDeque<FeedItem>,
     pub focus: Focus,
     pub show_help: bool,
@@ -188,6 +189,7 @@ impl AppState {
             gateway_history: VecDeque::with_capacity(GATEWAY_HISTORY),
             dns_history: VecDeque::with_capacity(DNS_HISTORY),
             findings: HashMap::new(),
+            sensor_health: HashMap::new(),
             event_feed: VecDeque::with_capacity(EVENT_FEED_LIMIT),
             focus: Focus::Overview,
             show_help: false,
@@ -218,10 +220,19 @@ impl AppState {
                 self.findings
                     .insert(f.kind, (Instant::now(), f.clone()));
             }
+            Event::SensorHealth(h) => {
+                self.sensor_health.insert(h.sensor.clone(), h.clone());
+            }
             Event::InterfaceStateChanged(_) | Event::RoamDetected(_) => {}
         }
 
         self.push_feed(env);
+    }
+
+    /// Lookup current health for a sensor by id (e.g. `"wifi"`).
+    pub fn health_for(&self, sensor: &str) -> Option<&SensorHealth> {
+        self.sensor_health
+            .get(&SensorId::new(sensor))
     }
 
     fn push_feed(&mut self, env: &Envelope) {
@@ -247,7 +258,6 @@ pub struct FeedItem {
 }
 
 fn format_feed_line(env: &Envelope) -> Option<FeedItem> {
-    use signalscope_events::EventCategory as C;
     let line = match &env.event {
         Event::Wifi(o) => {
             let ssid = o
@@ -304,17 +314,22 @@ fn format_feed_line(env: &Envelope) -> Option<FeedItem> {
             f.confidence.value(),
             f.headline
         ),
+        Event::SensorHealth(h) => {
+            let backend = h.backend.as_deref().unwrap_or("—");
+            let detail = h
+                .detail
+                .as_deref()
+                .map(|d| format!(" ({d})"))
+                .unwrap_or_default();
+            format!(
+                "health {} → {:?} via {}{}",
+                h.sensor, h.state, backend, detail
+            )
+        }
     };
     Some(FeedItem {
         at: env.at,
-        category: match env.event.category() {
-            C::Wifi => C::Wifi,
-            C::Gateway => C::Gateway,
-            C::Dns => C::Dns,
-            C::Interface => C::Interface,
-            C::Roam => C::Roam,
-            C::Finding => C::Finding,
-        },
+        category: env.event.category(),
         line,
     })
 }

@@ -67,11 +67,46 @@ The `wifi/mod.rs` body is shared and picks the right adapter via `#[cfg]`.
 
 ## Sensors currently implemented
 
-| Sensor      | Cadence    | What it emits                          | Implementation notes                              |
-| ----------- | ---------- | -------------------------------------- | ------------------------------------------------- |
-| `wifi`      | 2 s + 15 s | `WifiObservation`, `ScanResult`        | macOS: shells out to legacy `airport`             |
-| `gateway`   | 1 s        | `GatewayLatencyObservation`            | shells out to `ping(8)`; discovers default GW     |
-| `dns`       | 3 s        | `DnsLatencyObservation`                | uses `hickory-resolver`                           |
+| Sensor      | Cadence    | What it emits                                           | Implementation notes                                                                  |
+| ----------- | ---------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `wifi`      | 10 s       | `WifiObservation`, `ScanResult`, `SensorHealth`         | macOS: layered backends — see below                                                   |
+| `gateway`   | 1 s        | `GatewayLatencyObservation`                             | shells out to `ping(8)`; discovers default GW                                         |
+| `dns`       | 3 s        | `DnsLatencyObservation`                                 | uses `hickory-resolver`                                                               |
+
+## Wi-Fi backend layering (macOS)
+
+The Wi-Fi sensor is one *semantic* surface backed by potentially several
+acquisition implementations. The selector lives in
+`signalscope-sensors/src/wifi/macos/mod.rs`. At sensor startup it picks
+exactly one backend, logs which it chose, and sticks with it.
+
+| Priority | Backend           | Notes                                                                                                       |
+| -------- | ----------------- | ----------------------------------------------------------------------------------------------------------- |
+| 1        | `system_profiler` | `system_profiler -xml SPAirPortDataType`, parsed via `plist`. Works on every modern macOS. No root.         |
+| 2        | `airport`         | Legacy `/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport`.         |
+
+`wdutil info` was considered as a third option. It overlaps heavily with
+`system_profiler` and requires root, so it was dropped from this phase.
+
+### What the modern path can and can't see
+
+`system_profiler` is privacy-aware. Without Location Services granted
+to the invoking shell, the parser will observe:
+
+- SSIDs as `<redacted>` (we normalize to `None`),
+- no `spairport_network_bssid` keys (we normalize to `None`),
+- neighbor signal/noise only for some entries (we normalize the missing
+  ones to `None`).
+
+We still ship those neighbors, because their channels remain useful for
+RF-density analysis. We mark the observations `ObservationConfidence::
+Inferred` so the UI / analysis can distinguish them from full readings.
+
+### Fixtures
+
+Parser tests run against frozen fixtures under
+`examples/fixtures/wifi/`. See that directory's `README.md` for the
+list of scenarios and the protocol for adding more (anonymize first).
 
 ## Sensors we plan to add
 
@@ -107,6 +142,19 @@ A sensor that crashes its task should not crash the program. It should:
 
 In particular, sensors must **not** publish synthetic "all-bad" events on
 failure — that would poison correlation. Silence is better than fabrication.
+
+### Loud silence: `SensorHealth`
+
+When the data plane goes quiet, the *health* plane should get loud.
+Sensors publish `Event::SensorHealth` on every state transition
+(`Operational` ↔ `HardwareDisabled` / `PermissionDenied` / `ParseFailed`
+/ `Stale` / `BackendUnavailable`). Two rules:
+
+1. Emit **only** on transitions. Don't heartbeat — the rest of the bus
+   is sparse, the health stream should match.
+2. Don't synthesize observations to compensate. If RSSI is unknown,
+   leave it `None` and let confidence reflect that. Lying about a value
+   to satisfy the schema poisons everything downstream.
 
 ## On privilege
 

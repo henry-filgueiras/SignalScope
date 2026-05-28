@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+	<dict>
+		<key>_dataType</key>
+		<string>SPAirPortDataType</string>
+		<key>_items</key>
+		<array>
+			<dict>
+				<key>spairport_airport_interfaces</key>
+				<array>
+					<dict>
+						<key>_name</key>
+						<string>en0</string>
+						<key>spairport_status_information</key>
+						<string>spairport_status_off</string>
+						<key>spairport_wireless_mac_address</key>
+						<string>22:33:44:55:66:77</string>
+					</dict>
+				</array>
+			</dict>
+		</array>
+	</dict>
+</array>
+</plist>

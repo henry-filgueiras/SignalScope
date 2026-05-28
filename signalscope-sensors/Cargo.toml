@@ -18,5 +18,8 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 hickory-resolver = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
 socket2 = { workspace = true }

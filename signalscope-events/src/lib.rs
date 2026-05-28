@@ -23,8 +23,8 @@ pub mod wifi;
 
 pub use ids::{EventId, SensorId};
 pub use wifi::{
-    BandClass, Bssid, Channel, ChannelWidth, NeighborAp, ScanResult, Security, Ssid,
-    WifiObservation,
+    BandClass, Bssid, Channel, ChannelWidth, NeighborAp, ObservationConfidence, ScanResult,
+    Security, Ssid, WifiObservation,
 };
 
 /// Wall-clock timestamp for an event. We use wall time (not `Instant`) so
@@ -120,6 +120,36 @@ pub enum FindingKind {
     StickyClient,
 }
 
+/// A sensor reporting on its own operational state. Use this to communicate
+/// degraded conditions (backend missing, permission denied, parse failure,
+/// hardware disabled) without inventing synthetic observations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SensorHealth {
+    pub sensor: SensorId,
+    pub state: SensorState,
+    /// Human-readable backend identifier when relevant (e.g.
+    /// `"system_profiler"`).
+    pub backend: Option<String>,
+    /// Free-form detail for the UI / logs. Keep short.
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SensorState {
+    /// Sensor is emitting fresh observations.
+    Operational,
+    /// No acquisition backend is available on this host.
+    BackendUnavailable,
+    /// The platform reports the underlying hardware as off / disabled.
+    HardwareDisabled,
+    /// Permission required to read telemetry was denied.
+    PermissionDenied,
+    /// Backend returned data that the parser could not interpret.
+    ParseFailed,
+    /// Backend timed out or temporarily failed; older data is now stale.
+    Stale,
+}
+
 /// The full set of payloads carried by the event bus.
 ///
 /// New variants should describe semantic observations or derived findings —
@@ -134,6 +164,7 @@ pub enum Event {
     InterfaceStateChanged(InterfaceStateChanged),
     RoamDetected(RoamDetected),
     Finding(CorrelationFinding),
+    SensorHealth(SensorHealth),
 }
 
 impl Event {
@@ -145,6 +176,7 @@ impl Event {
             Event::InterfaceStateChanged(_) => EventCategory::Interface,
             Event::RoamDetected(_) => EventCategory::Roam,
             Event::Finding(_) => EventCategory::Finding,
+            Event::SensorHealth(_) => EventCategory::Health,
         }
     }
 }
@@ -157,6 +189,7 @@ pub enum EventCategory {
     Interface,
     Roam,
     Finding,
+    Health,
 }
 
 /// Envelope written to the event bus. Once published the envelope is treated

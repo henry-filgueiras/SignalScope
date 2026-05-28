@@ -98,7 +98,27 @@ pub enum Security {
     Wpa,
     Wpa2,
     Wpa3,
+    /// WPA2/WPA3 transition / mixed mode.
+    Wpa3Transition,
     Unknown,
+}
+
+/// Epistemic tag attached to observations. The intent is to be honest about
+/// *how* we know what we know rather than blurring inference and direct
+/// measurement together. Use sparingly; the default is `Direct`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum ObservationConfidence {
+    /// Reported directly by the platform telemetry source.
+    #[default]
+    Direct,
+    /// Derived from another direct value (e.g. band class from channel
+    /// number).
+    Inferred,
+    /// Best-guess fallback when the underlying source omitted the value.
+    Estimated,
+    /// Previously direct, but the source is now unavailable; consumer
+    /// should treat as out-of-date.
+    Stale,
 }
 
 /// Snapshot of the *currently associated* Wi-Fi link.
@@ -112,6 +132,11 @@ pub struct WifiObservation {
     pub tx_rate_mbps: Option<f32>,
     pub channel: Option<Channel>,
     pub security: Option<Security>,
+    /// Free-form PHY mode string as reported by the platform (e.g.
+    /// `"802.11ax"`, `"802.11a/n/ac/ax"`). Kept as a string because the
+    /// platform reports it as one and we don't yet have a reason to enumerate.
+    pub phy_mode: Option<String>,
+    pub confidence: ObservationConfidence,
 }
 
 impl WifiObservation {
@@ -125,13 +150,21 @@ impl WifiObservation {
 }
 
 /// A single neighbor AP observed during a scan.
+///
+/// `bssid` and `rssi_dbm` are optional because some platforms — notably
+/// modern macOS without Location Services permission — redact identifiers
+/// and omit signal strength. We still surface these neighbors because the
+/// *count* and *channel* distribution remain useful signals for RF
+/// congestion analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NeighborAp {
-    pub bssid: Bssid,
+    pub bssid: Option<Bssid>,
     pub ssid: Option<Ssid>,
-    pub rssi_dbm: i32,
+    pub rssi_dbm: Option<i32>,
     pub channel: Option<Channel>,
     pub security: Option<Security>,
+    pub phy_mode: Option<String>,
+    pub confidence: ObservationConfidence,
 }
 
 /// Result of a full neighbor scan at a moment in time.

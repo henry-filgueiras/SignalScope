@@ -105,7 +105,8 @@ fn ingest(
         Event::DnsLatency(o) => dns.record(o),
         Event::InterfaceStateChanged(_)
         | Event::RoamDetected(_)
-        | Event::Finding(_) => {}
+        | Event::Finding(_)
+        | Event::SensorHealth(_) => {}
     }
 }
 

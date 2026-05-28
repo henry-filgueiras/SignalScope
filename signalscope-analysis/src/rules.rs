@@ -155,11 +155,17 @@ fn sticky_client(wifi: &WifiState) -> Option<CorrelationFinding> {
         if ap.ssid.as_ref() != Some(ssid) {
             continue;
         }
-        if &ap.bssid == bssid {
+        let Some(ap_bssid) = ap.bssid.as_ref() else {
+            continue;
+        };
+        let Some(ap_rssi) = ap.rssi_dbm else {
+            continue;
+        };
+        if ap_bssid == bssid {
             continue;
         }
-        if best.map_or(true, |(_, r)| ap.rssi_dbm > r) {
-            best = Some((&ap.bssid, ap.rssi_dbm));
+        if best.map_or(true, |(_, r)| ap_rssi > r) {
+            best = Some((ap_bssid, ap_rssi));
         }
     }
 

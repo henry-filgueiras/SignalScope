@@ -88,6 +88,47 @@ We do not pretend to know ground truth. We do not run statistical models.
 We do not invoke an LLM. The rules are hand-tuned heuristics that explain
 themselves. Better rules will replace them.
 
+## Observation epistemics
+
+Findings carry confidence; *observations* also carry confidence, via the
+`ObservationConfidence` tag (`Direct`, `Inferred`, `Estimated`, `Stale`).
+This is a deliberate epistemic-honesty primitive — different platforms
+report different fidelities, and we don't want analysis or rendering to
+treat an inferred value as if it were measured.
+
+Concrete cases:
+
+- macOS without Location Services redacts SSIDs to `<redacted>` and
+  omits BSSIDs. The sensor still reports those observations, marks them
+  `Inferred`, and the TUI shows a dim "(redacted source)" badge so the
+  operator immediately understands they're not looking at a full-fidelity
+  reading.
+- A neighbor whose RSSI was not reported still ships in the scan because
+  it contributes to channel density signal — also `Inferred`.
+
+The rule of thumb: prefer **honest partial data** over **silent omission**
+or **synthetic filler**.
+
+## Degraded-state semantics
+
+When acquisition fails, sensors publish a `SensorHealth` event rather
+than synthesizing a fake observation or going silent. The state machine
+is intentionally small:
+
+| State                | Meaning                                                    |
+| -------------------- | ---------------------------------------------------------- |
+| `Operational`        | acquisition succeeded; observations are fresh              |
+| `BackendUnavailable` | no acquisition path exists on this host                    |
+| `HardwareDisabled`   | hardware reports off (e.g. Wi-Fi turned off)               |
+| `PermissionDenied`   | telemetry source requires a permission we don't have       |
+| `ParseFailed`        | the backend's output couldn't be interpreted               |
+| `Stale`              | a transient failure; whatever we had is now out of date    |
+
+Sensors only emit on transitions, not on every successful cycle — the
+health stream is meant to be sparse and readable, not a heartbeat.
+The TUI keeps the latest `SensorHealth` per `SensorId` and surfaces it
+in the relevant card (today: the Wi-Fi card title and an inline banner).
+
 ## Replayability is a design constraint, not a feature
 
 We use wall-clock `OffsetDateTime` (not `Instant`) on every envelope so the

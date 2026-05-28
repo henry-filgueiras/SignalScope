@@ -19,8 +19,15 @@ architectural goal — see [`docs/architecture.md`](docs/architecture.md) and
 
 ## What works today
 
-- live Wi-Fi link card (SSID, BSSID, RSSI, noise, SNR, channel)
-- neighbor AP list with band and channel
+- live Wi-Fi link card (SSID, BSSID, RSSI, noise, SNR, channel, PHY mode)
+  driven by `system_profiler -xml SPAirPortDataType` on macOS, with a
+  legacy `airport` fallback
+- neighbor AP list with band, channel, and 6 GHz / Wi-Fi 6E support
+- sensor-health surface — when Wi-Fi is off, redacted, or a backend is
+  missing, the card shows the actual state instead of going silent
+- per-observation confidence tags (`Direct` / `Inferred` / `Estimated`
+  / `Stale`) so the UI can distinguish "we measured this" from
+  "we inferred this" from "we used to know this"
 - gateway latency probe + rolling sparkline
 - DNS latency probe + rolling sparkline
 - lightweight correlation rules with confidence + evidence
@@ -77,10 +84,17 @@ everything, sensors know about events + core, events knows about nothing.
 
 ## Caveats
 
-- The macOS Wi-Fi adapter shells out to the legacy `airport` binary. On
-  macOS 14.4+ that binary was removed; SignalScope logs a warning and runs
-  without live Wi-Fi telemetry. A `system_profiler` / `wdutil` adapter is
-  intentional future work.
+- The macOS Wi-Fi sensor's primary backend is
+  `system_profiler -xml SPAirPortDataType`. Without Location Services
+  permission for the invoking terminal, macOS redacts SSIDs as
+  `<redacted>` and omits BSSIDs entirely. SignalScope still surfaces
+  channel + signal density (useful for RF analysis) and tags the
+  observation `Inferred` so the UI can show it's a partial reading.
+  Grant Location Services to your terminal of choice to get full
+  identifiers.
+- The legacy `airport` backend is retained for pre-Sonoma hosts only.
+  On macOS 14.4+ it doesn't exist; the sensor will pick
+  `system_profiler` automatically.
 - Gateway probes use `ping(8)`. Replacing this with a `socket2` ICMP path
   (no subprocess overhead) is intentional future work.
 
