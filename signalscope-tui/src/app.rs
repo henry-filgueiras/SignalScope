@@ -29,11 +29,17 @@ use tracing::warn;
 
 use crate::replay::Playback;
 use crate::ui;
+use crate::waterfall::{ChannelKey, ScanSample};
 
 const GATEWAY_HISTORY: usize = 240;
 const DNS_HISTORY: usize = 240;
 const EVENT_FEED_LIMIT: usize = 200;
 const SIGNAL_HISTORY: usize = 90;
+/// Per-scan samples retained for the RF waterfall. At the Wi-Fi sensor's
+/// ~10 s scan cadence this is ~20 min of columns — roughly 4× the panel's
+/// cell width on a 120-col terminal, so ultra-wide terminals still fill.
+/// Columns are per-scan (event-anchored), not per-wall-clock-slice.
+const SCAN_HISTORY: usize = 120;
 /// Throughput is derived from successive counter snapshots. Mirrors the
 /// analysis crate's `THROUGHPUT_WINDOW` so the dashboard and the future
 /// finding rules speak about the same rolling rate.
@@ -197,6 +203,27 @@ enum InputOutcome {
     Quit,
 }
 
+/// Which body the RF environment panel renders. Occupancy is home; `d`
+/// and `w` each jump straight to their view, and pressing the same key
+/// again returns to occupancy (stateless — no "previous view" memory).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RfPanelView {
+    #[default]
+    Occupancy,
+    ApTable,
+    Waterfall,
+}
+
+impl RfPanelView {
+    fn toggled(self, target: Self) -> Self {
+        if self == target {
+            Self::Occupancy
+        } else {
+            target
+        }
+    }
+}
+
 fn handle_input(ev: CtEvent, state: &mut AppState) -> InputOutcome {
     if let CtEvent::Key(k) = ev {
         if k.kind != KeyEventKind::Press {
@@ -209,7 +236,10 @@ fn handle_input(ev: CtEvent, state: &mut AppState) -> InputOutcome {
                 state.show_help = !state.show_help;
             }
             (KeyCode::Char('d'), _) => {
-                state.show_neighbor_detail = !state.show_neighbor_detail;
+                state.rf_view = state.rf_view.toggled(RfPanelView::ApTable);
+            }
+            (KeyCode::Char('w'), _) => {
+                state.rf_view = state.rf_view.toggled(RfPanelView::Waterfall);
             }
             (KeyCode::Char('f'), _) => {
                 state.focus = state.focus.next();
@@ -239,7 +269,11 @@ fn handle_replay_input(ev: CtEvent, state: &mut AppState) -> InputOutcome {
                 return InputOutcome::Continue;
             }
             (KeyCode::Char('d'), _) => {
-                state.show_neighbor_detail = !state.show_neighbor_detail;
+                state.rf_view = state.rf_view.toggled(RfPanelView::ApTable);
+                return InputOutcome::Continue;
+            }
+            (KeyCode::Char('w'), _) => {
+                state.rf_view = state.rf_view.toggled(RfPanelView::Waterfall);
                 return InputOutcome::Continue;
             }
             (KeyCode::Char('f'), _) | (KeyCode::Tab, _) => {
@@ -326,6 +360,10 @@ pub struct AppState {
     pub started_at: Instant,
     pub latest_wifi: Option<WifiObservation>,
     pub latest_scan: Option<ScanResult>,
+    /// Per-scan channel-occupancy history backing the RF waterfall. The
+    /// connected channel is captured into each sample at scan-ingest
+    /// time, so a replay rebuild renders the identical grid.
+    pub scan_history: TemporalSeries<ScanSample>,
     /// Wall-clock-timestamped gateway probe history. Each sample carries
     /// the full observation so the panel can read out target, RTT, and
     /// reachability without a parallel structure.
@@ -363,10 +401,10 @@ pub struct AppState {
     pub tx_throughput_history: TemporalSeries<f64>,
     pub focus: Focus,
     pub show_help: bool,
-    /// When true, the RF environment panel renders the neighbor AP table
-    /// instead of the occupancy histogram. Default is the histogram —
-    /// individual identities are demoted to opt-in detail.
-    pub show_neighbor_detail: bool,
+    /// Which body the RF environment panel renders. Default is the
+    /// occupancy histogram — individual AP identities and the waterfall
+    /// are opt-in views (`d` / `w`).
+    pub rf_view: RfPanelView,
     /// `Some` in `signalscope analyze` mode. When set, `virtual_now()`
     /// returns the playhead's wall-clock `at` instead of real time, so
     /// every temporal callout on the dashboard ("Held 12m", "stable
@@ -381,6 +419,7 @@ impl AppState {
             started_at: Instant::now(),
             latest_wifi: None,
             latest_scan: None,
+            scan_history: TemporalSeries::new(SCAN_HISTORY),
             gateway_history: TemporalSeries::new(GATEWAY_HISTORY),
             dns_history: TemporalSeries::new(DNS_HISTORY),
             findings: HashMap::new(),
@@ -395,7 +434,7 @@ impl AppState {
             tx_throughput_history: TemporalSeries::new(THROUGHPUT_HISTORY),
             focus: Focus::Overview,
             show_help: false,
-            show_neighbor_detail: false,
+            rf_view: RfPanelView::Occupancy,
             playback: None,
         }
     }
@@ -416,6 +455,7 @@ impl AppState {
     pub fn reset_for_replay(&mut self) {
         self.latest_wifi = None;
         self.latest_scan = None;
+        self.scan_history.clear();
         self.gateway_history.clear();
         self.dns_history.clear();
         self.findings.clear();
@@ -451,6 +491,13 @@ impl AppState {
                 self.latest_wifi = Some(o.clone());
             }
             Event::Scan(s) => {
+                let connected = self
+                    .latest_wifi
+                    .as_ref()
+                    .and_then(|w| w.channel)
+                    .map(ChannelKey::from);
+                self.scan_history
+                    .push(env.at, ScanSample::from_scan(s, connected));
                 self.latest_scan = Some(s.clone());
             }
             Event::GatewayLatency(o) => {

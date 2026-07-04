@@ -119,10 +119,10 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         crate::app::Focus::Neighbors => "neighbors",
         crate::app::Focus::Findings => "findings",
     };
-    let detail_label = if state.show_neighbor_detail {
-        "AP table"
-    } else {
-        "occupancy"
+    let detail_label = match state.rf_view {
+        crate::app::RfPanelView::Occupancy => "occupancy",
+        crate::app::RfPanelView::ApTable => "AP table",
+        crate::app::RfPanelView::Waterfall => "waterfall",
     };
     let mut spans = vec![
         Span::styled("q ", theme::value()),
@@ -131,6 +131,8 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled("focus ", theme::dim()),
         Span::styled(" · d ", theme::value()),
         Span::styled("RF view ", theme::dim()),
+        Span::styled(" · w ", theme::value()),
+        Span::styled("waterfall ", theme::dim()),
     ];
     if state.playback.is_some() {
         spans.push(Span::styled(" · [/] ", theme::value()));
@@ -772,7 +774,11 @@ fn render_rf_environment(f: &mut Frame, area: Rect, state: &AppState) {
         .map(|s| s.neighbors.as_slice())
         .unwrap_or(&[]);
 
-    let mode_hint = if state.show_neighbor_detail { "detail" } else { "occupancy" };
+    let mode_hint = match state.rf_view {
+        crate::app::RfPanelView::Occupancy => "occupancy",
+        crate::app::RfPanelView::ApTable => "detail",
+        crate::app::RfPanelView::Waterfall => "waterfall",
+    };
     let block = card_block(&format!(
         "RF environment · {} APs visible · {mode_hint}",
         neighbors.len()
@@ -794,11 +800,155 @@ fn render_rf_environment(f: &mut Frame, area: Rect, state: &AppState) {
     .split(inner);
     f.render_widget(Paragraph::new(summary), layout[0]);
 
-    if state.show_neighbor_detail {
-        render_neighbor_table(f, layout[2], neighbors, state.latest_wifi.as_ref());
-    } else {
-        render_occupancy_histogram(f, layout[2], neighbors, connected_channel);
+    match state.rf_view {
+        crate::app::RfPanelView::ApTable => {
+            render_neighbor_table(f, layout[2], neighbors, state.latest_wifi.as_ref());
+        }
+        crate::app::RfPanelView::Waterfall => {
+            render_rf_waterfall(f, layout[2], state);
+        }
+        crate::app::RfPanelView::Occupancy => {
+            render_occupancy_histogram(f, layout[2], neighbors, connected_channel);
+        }
     }
+}
+
+/// The RF waterfall: channels × time. Rows are channels in fixed spectral
+/// order (never reranked — a time-axis display must hold its rows still),
+/// columns are per-scan samples with the newest hugging the right edge,
+/// matching the sparkline idiom. Cell shade rides the same
+/// `pressure_tier` ladder as the occupancy bars; the connected channel's
+/// cell renders bright/bold so a roam draws itself as the trace jumping
+/// rows. Projection math lives in `crate::waterfall` (pure, unit-tested);
+/// this function only converts the grid to spans.
+fn render_rf_waterfall(f: &mut Frame, area: Rect, state: &AppState) {
+    use crate::waterfall::{compute_waterfall, glyph_for_count, RowKind, ScanSample};
+    use signalscope_core::TemporalSample;
+
+    if state.scan_history.is_empty() {
+        f.render_widget(
+            Paragraph::new("no scan history yet — awaiting first scan").style(theme::dim()),
+            area,
+        );
+        return;
+    }
+
+    /// `▸` marker (1) + band `{:>3}` (3) + space + `ch{:<4}` (6) + space.
+    const GUTTER: u16 = 12;
+    if area.height == 0 || area.width <= GUTTER + 4 {
+        f.render_widget(
+            Paragraph::new("widen terminal for waterfall").style(theme::dim()),
+            area,
+        );
+        return;
+    }
+    let max_cols = (area.width - GUTTER) as usize;
+    // Reserve the last row for the time axis when there's room for one.
+    let has_axis = area.height >= 2;
+    let max_rows = if has_axis { area.height - 1 } else { area.height } as usize;
+
+    let samples: Vec<&TemporalSample<ScanSample>> = state.scan_history.iter().collect();
+    let grid = compute_waterfall(&samples, max_rows, max_cols);
+    let newest_connected = samples.last().and_then(|s| s.value.connected);
+
+    // Blank left-pad so the newest column always hugs the right edge.
+    // Blank means "no scan exists here" — deliberately distinct from the
+    // dim `·` that means "a scan ran and measured quiet".
+    let pad = max_cols.saturating_sub(grid.columns);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(grid.rows.len() + 1);
+    for row in &grid.rows {
+        let mut spans: Vec<Span> = Vec::with_capacity(grid.columns + 3);
+        match row.kind {
+            RowKind::Channel(key) => {
+                let label = format!("ch{:<4} ", key.number);
+                if newest_connected == Some(key) {
+                    spans.push(Span::styled(
+                        format!("▸{:>3} {label}", key.band_label()),
+                        theme::title_style(),
+                    ));
+                } else {
+                    spans.push(Span::styled(
+                        format!(" {:>3} ", key.band_label()),
+                        theme::dim(),
+                    ));
+                    spans.push(Span::styled(label, theme::value()));
+                }
+            }
+            RowKind::Other => {
+                spans.push(Span::styled(
+                    format!("{:<12}", format!(" ·  +{} ch", grid.hidden_channels)),
+                    theme::dim(),
+                ));
+            }
+        }
+        if pad > 0 {
+            spans.push(Span::raw(" ".repeat(pad)));
+        }
+        for cell in &row.cells {
+            let (glyph, style) = if cell.connected {
+                // Glyph floors at ░ so a 0-neighbor connected channel
+                // still traces; TITLE_FG + bold carries the identity.
+                let g = if cell.count == 0 {
+                    "░"
+                } else {
+                    glyph_for_count(cell.count)
+                };
+                (g, theme::title_style())
+            } else if cell.count == 0 {
+                ("·", theme::dim())
+            } else {
+                (
+                    glyph_for_count(cell.count),
+                    Style::default().fg(tier_color(pressure_tier(cell.count))),
+                )
+            };
+            spans.push(Span::styled(glyph, style));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    if has_axis {
+        if let Some((oldest, _)) = grid.span {
+            lines.push(waterfall_axis_line(
+                state.virtual_now(),
+                oldest,
+                GUTTER as usize + pad,
+                grid.columns,
+            ));
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Dim time-axis footer under the waterfall cells:
+/// `└ 4m ago ────────── now ┘`, aligned to the populated cell region.
+/// Degrades to a right-aligned `now ┘` when the region is too narrow for
+/// both labels, and to nothing when it can't even fit that.
+fn waterfall_axis_line(
+    now: time::OffsetDateTime,
+    oldest: time::OffsetDateTime,
+    indent: usize,
+    region: usize,
+) -> Line<'static> {
+    let age_secs = (now - oldest).whole_seconds().max(0) as u64;
+    let age = humanize_duration(std::time::Duration::from_secs(age_secs));
+    let left = format!("└ {age} ago ");
+    let right = " now ┘";
+    let left_w = left.chars().count();
+    let right_w = right.chars().count();
+    let axis = if region >= left_w + right_w {
+        format!("{left}{}{right}", "─".repeat(region - left_w - right_w))
+    } else if region >= right_w {
+        format!("{}{right}", " ".repeat(region - right_w))
+    } else {
+        String::new()
+    };
+    Line::from(vec![
+        Span::raw(" ".repeat(indent)),
+        Span::styled(axis, theme::dim()),
+    ])
 }
 
 /// One-line "ambient weather report" for the RF environment card.
@@ -1535,7 +1685,7 @@ fn fmt_offset_clock(secs: u64) -> String {
 }
 
 fn render_help_overlay(f: &mut Frame, area: Rect, replay_mode: bool) {
-    let h = if replay_mode { 20 } else { 11 };
+    let h = if replay_mode { 21 } else { 12 };
     let w = 62.min(area.width.saturating_sub(4));
     let h = (h as u16).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
@@ -1555,6 +1705,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect, replay_mode: bool) {
         Line::from("Ctrl-C         quit"),
         Line::from("tab / f        cycle focus"),
         Line::from("d              toggle RF view (occupancy ↔ AP table)"),
+        Line::from("w              toggle RF waterfall (channels × time)"),
         Line::from("?              toggle this help"),
     ];
     if replay_mode {
@@ -1807,5 +1958,50 @@ mod tests {
         ];
         let ranked = relevance_order(&entries, None);
         assert_eq!(nums(&ranked), vec![6, 11, 149]);
+    }
+
+    /// End-to-end render smoke for the waterfall view: the projection
+    /// math has its own unit tests in `waterfall::tests`; this pins that
+    /// the span-conversion layer actually draws without panicking and
+    /// puts the expected glyphs on screen.
+    #[test]
+    fn waterfall_view_renders_cells_and_connected_row() {
+        use crate::app::{AppState, RfPanelView};
+        use crate::waterfall::{ChannelKey, ScanSample};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::collections::BTreeMap;
+
+        let mut state = AppState::new();
+        state.rf_view = RfPanelView::Waterfall;
+
+        let conn = ChannelKey::from(ch(44, BandClass::FiveGhz));
+        let mut channel_counts = BTreeMap::new();
+        channel_counts.insert(ChannelKey::from(ch(6, BandClass::TwoPointFourGhz)), 4);
+        channel_counts.insert(conn, 2);
+        let scan = ScanSample {
+            channel_counts,
+            connected: Some(conn),
+        };
+        let t0 = time::OffsetDateTime::UNIX_EPOCH;
+        state.scan_history.push(t0, scan.clone());
+        state.scan_history.push(t0 + time::Duration::seconds(10), scan);
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(content.contains("waterfall"), "panel title shows the view");
+        assert!(content.contains("ch44"), "connected channel row is labeled");
+        assert!(content.contains("ch6"), "neighbor channel row is labeled");
+        assert!(content.contains('▒'), "count-4 cell shades moderate");
+        assert!(content.contains('░'), "connected count-2 cell shades low");
     }
 }

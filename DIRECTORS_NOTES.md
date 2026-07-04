@@ -141,6 +141,45 @@ entry — the old direction resolves and the new one goes Active.
 "Stabilising" is naturally expressed as the Resolved edge of a
 previously-active trend.
 
+### RF waterfall (channels × time)
+
+Third view of the RF environment panel, `w`-toggled. View state is
+`RfPanelView { Occupancy, ApTable, Waterfall }`; `d` and `w` each jump
+straight to their view and pressing the same key again returns to
+occupancy (stateless — no "previous view" memory).
+
+Channels are rows in **fixed spectral order** (band, then number) —
+deliberately the opposite of the occupancy view's relevance ranking,
+because a time-axis display must never rerank rows between frames.
+Columns are per-scan and event-anchored (no wall-clock interpolation),
+newest hugging the right edge, matching the sparkline idiom.
+
+Cell shade rides the existing `pressure_tier` ladder, colored by
+`tier_color`: dim `·` = a scan ran and measured quiet; `░▒▓█` =
+low / moderate / elevated / severe. A blank left-pad column means "no
+scan exists here" — deliberately distinct from `·` (the observation-
+epistemics stance applied to pixels). The connected channel's cell
+renders TITLE_FG bold with the glyph floored at `░`, so a roam draws
+itself as the bright trace jumping rows.
+
+Backing state is `AppState::scan_history: TemporalSeries<ScanSample>`
+(120 samples ≈ 20 min at the ~10 s scan cadence). The connected
+channel is captured into each sample at scan-ingest time, so a replay
+rebuild renders the identical grid with zero special-casing. When
+channels exceed the row budget, every channel that was connected
+anywhere in the visible window is kept first (the roam trace must
+never lose its tail), then highest total window density; the rest
+aggregate into a `· +N ch` bottom row. Channel identity is
+`ChannelKey (band_rank, number)` — not a bare channel number, because
+6 GHz numbers collide with 2.4 GHz; Unknown bands normalize through
+`BandClass::from_channel_number` before giving up.
+
+Projection math is pure (`signalscope-tui::waterfall`, strip.rs
+pattern) and unit-tested without ratatui.
+
+**Invariant:** any new event-derived `AppState` field must be cleared
+in `reset_for_replay` — `scan_history` is.
+
 ### Wi-Fi backend layering (macOS)
 
 Inside `signalscope-sensors/src/wifi/macos/` the sensor picks one
@@ -594,6 +633,99 @@ The TUI owns the terminal, so logs go to a rotating file under
 ---
 
 ## Resolved Dragons and Pivots
+
+### 2026-07-03 — claude-fable-5 (RF waterfall: channels × time third view)
+
+Ships proposal #2 from the same-day ideation sweep (entry below).
+The TUI previously stored scans latest-only (`latest_scan`
+overwritten every ~10 s) — the temporal dimension of scan data was
+discarded at the door. Now it's retained and rendered.
+
+**New module** `signalscope-tui/src/waterfall.rs` — pure projection
+math (strip.rs pattern, zero ratatui imports): `ChannelKey`,
+`ScanSample`, `compute_waterfall(samples, max_rows, max_cols) ->
+WaterfallGrid`, `glyph_for_count`. 14 unit tests pin the contract:
+empty/zero-dim inputs, spectral sort, row-order stability under
+density shifts, newest-window truncation, zero-count cells,
+connected-flag placement, zero-neighbor connected channel still
+rows, roam trace across columns, aggregation arithmetic +
+`hidden_channels`, connected-history privileged over density in
+aggregation, Unknown-band normalization, glyph ladder boundaries.
+
+**Notable calls:**
+
+- Fixed spectral row order (vs occupancy's relevance ranking)
+  because time-axis rows must not jump between frames.
+- Connected-channel *history* is privileged over raw density in row
+  aggregation so a roam trace never loses its tail to a louder
+  channel.
+- `·` vs blank encodes measured-quiet vs no-data — the observation-
+  epistemics stance applied to individual cells.
+- `ChannelKey(band_rank, number)` not bare `u16` — 6 GHz channel
+  numbers collide with 2.4 GHz.
+- Connected channel captured into each `ScanSample` at ingest time
+  from `latest_wifi`, so replay's full-rebuild renders byte-identical
+  grids with zero special-casing. `scan_history` cleared in
+  `reset_for_replay` (the one silently-breakable step — see the new
+  Canon invariant).
+
+**Plumbing.** `show_neighbor_detail: bool` replaced by
+`RfPanelView { Occupancy, ApTable, Waterfall }`; `d`/`w` each jump
+to their view, same key returns to occupancy. `w` bound in both live
+and replay handlers. Footer + help overlay updated (help heights
+11→12 live, 20→21 replay).
+
+**Verification.** `cargo test --workspace`: **130/130 green** (was
+115; +14 waterfall projection tests, +1 ratatui `TestBackend` render
+smoke pinning that the span-conversion layer draws the expected
+glyphs and labels). Zero new clippy warnings (13 before, 13 after —
+all pre-existing). Smoke: `scripts/record.sh 15s` captured a session
+with scan events; `scripts/analyze.sh` loaded it cleanly to the
+terminal-setup step (no tty in the test harness — same
+non-interactive smoke shape as the timeline-strip slice).
+
+**Untouched.** Bus shape, event model, sensors, analysis crate,
+session format, landmarks/strip/capture/inspect paths, scripts.
+Pure addition in the TUI crate plus the `RfPanelView` rename.
+
+### 2026-07-03 — claude-fable-5 (feature ideation sweep: eight proposals, no code)
+
+Operator asked for ambitious feature proposals prioritizing ergonomics
+and observability of the existing data set (explicitly not mechanical
+work like Linux ports). Eight proposals were tabled, ranked by
+wow-per-line-of-code; none are committed scope until the operator
+picks. Recording them here so future sessions can pick up the thread:
+
+1. **Operator marks** — `m` in observe mode drops a timestamped
+   operator note into the session file as a new `SessionRow` variant
+   (the tagged enum anticipated exactly this); surfaces as a
+   `Notable` landmark in replay. Rationale: the one sensor we can't
+   build is the physical world, and the operator is standing in it.
+2. **RF waterfall** — `w`-toggled spectrogram panel: time × channel,
+   cell intensity = AP density per scan, connected channel drawn as a
+   bright trace (roams draw themselves as the line jumping columns).
+   Uses the scan history we already capture but only render latest-of.
+3. **Ghost overlay** — `--ghost SESSION` replays a recorded session
+   silently, time-aligned, as dim traces behind the live sparklines;
+   later, a p10–p90 "ambient normal" band from accumulated sessions.
+   Leans on `FileEventSource` + wall-clock `TemporalSeries`.
+4. **Chronoscope** — always-on rotating ring of session segments +
+   `signalscope timewarp 15m` to replay the recent past after the
+   fact; auto "black-box ejection" freezing ±2 min around
+   high-confidence Active findings into `incidents/`.
+5. **Finding forensics** — Enter on a finding opens evidence detail:
+   contributing envelopes ±60 s as a micro-strip, threshold-vs-
+   observed gauges. Makes confidence scores inspectable arguments.
+6. **Trend vectors** — extrapolate existing window deltas into
+   honest callouts ("crosses −75 dBm in ~4 m if trend holds").
+7. **Mission report** — `signalscope report PATH` renders a
+   deterministic markdown/ANSI post-flight digest of a recording.
+8. **Differential replay** — align two sessions and diff stances
+   (hotspot vs Wi-Fi, last night vs tonight). Deferred until ghost
+   mode establishes the comparison primitives.
+
+Recommended order: 1 → 2 → 3 (marks ship first so every future
+recording carries ground truth), then 4. No code, no Canon changes.
 
 ### 2026-05-28 — Claude Opus 4.7 (signal quality: wakeup-aware findings + holdtime landmarks)
 

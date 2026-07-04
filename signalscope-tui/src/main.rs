@@ -25,6 +25,7 @@ mod replay;
 mod strip;
 mod theme;
 mod ui;
+mod waterfall;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
